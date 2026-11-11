@@ -117,7 +117,7 @@ function Assert-Incompatible {
 }
 function Assert-NoSecretInStore {
     param([string]$Secret)
-    foreach ($file in @(Get-ChildItem -LiteralPath $script:RTCaseDirectory -Recurse -File)) {
+    foreach ($file in @(Get-ChildItem -LiteralPath @($script:RTCaseDirectory, $script:RelayCredentialBaseDirectory) -Recurse -File)) {
         $text = [IO.File]::ReadAllText($file.FullName)
         Assert-True (-not $text.Contains($Secret)) ('Plaintext API key leaked to ' + $file.Name)
     }
@@ -125,6 +125,10 @@ function Assert-NoSecretInStore {
 function Invoke-RelayTestCase {
     param($Test)
     $script:RTCaseDirectory = New-RelayTestDirectory
+    $oldCredentialBase = $script:RelayCredentialBaseDirectory
+    # Temp/AppData may be writable by sandbox identities; exercise a safe private ancestry.
+    $privateTestBase = Join-Path ([Environment]::GetFolderPath('UserProfile')) ('.relay-private-tests-' + [guid]::NewGuid().ToString('N'))
+    $script:RelayCredentialBaseDirectory = $privateTestBase
     $oldPreference = $ErrorActionPreference
     try {
         $ErrorActionPreference = 'Stop'
@@ -136,6 +140,11 @@ function Invoke-RelayTestCase {
     } finally {
         $ErrorActionPreference = $oldPreference
         if (Test-Path -LiteralPath $script:RTCaseDirectory) { Remove-Item -LiteralPath $script:RTCaseDirectory -Force -Recurse }
+        $resolvedPrivate = [IO.Path]::GetFullPath($privateTestBase)
+        $testPrivateParent = [IO.Path]::GetFullPath([Environment]::GetFolderPath('UserProfile')).TrimEnd('\')
+        if ([IO.Path]::GetDirectoryName($resolvedPrivate) -ine $testPrivateParent -or [IO.Path]::GetFileName($resolvedPrivate) -cnotmatch '^\.relay-private-tests-[a-f0-9]{32}$') { throw 'Test private cleanup escaped its dedicated test directory.' }
+        if (Test-Path -LiteralPath $resolvedPrivate) { Remove-Item -LiteralPath $resolvedPrivate -Force -Recurse }
+        $script:RelayCredentialBaseDirectory = $oldCredentialBase
     }
 }
 function Get-TestTomlLiteralValue {

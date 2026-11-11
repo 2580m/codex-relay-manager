@@ -198,7 +198,6 @@ requires_openai_auth = false
 
 ```text
 %USERPROFILE%\.codex-relay\
-├── providers.json
 ├── cache\
 │   ├── relay_<随机ID>-models.json
 │   └── relay_<随机ID>-compatibility.json
@@ -207,15 +206,37 @@ requires_openai_auth = false
 │       ├── models.json
 │       ├── relay.config.toml
 │       └── *.随机事务ID.bak
-├── credentials\
-│   └── credential-helper.ps1
+├── auth-runtime\                  # auth.cwd；不保存密钥、密文或助手代码
 ├── shared-config\                 # 受限 ACL 的共享配置备份及事务记录
 └── logs\
+
+%USERPROFILE%\.codex-relay-private\
+└── <数据目录路径的 SHA-256>\       # 不同 -DataDirectory 对应不同私有存储
+    ├── providers.json             # 仅 DPAPI 密文与 Provider 元数据
+    ├── credentials\
+    │   └── credential-helper.ps1
+    └── legacy-providers.*.bak      # 迁移前的原始密文备份（如有）
 ```
 
-可以用 `-DataDirectory 'D:\private\codex-relay-data'` 指定**专用目录**，不要指向项目根目录或与其他应用共享的目录。初始化会收紧该目录 ACL，当前 Windows 用户和 SYSTEM 完全控制；若本机存在 `CodexSandboxUsers`，按本机账户解析 SID，仅授予/接受读取与执行（含 Synchronize），不接受其写入、修改或完全控制；其他额外账户仍拒绝。拒绝数据目录重解析点。默认不写运行日志，`logs` 目录预留；不记录网络正文或密钥。
+可以用 `-DataDirectory 'D:\private\codex-relay-data'` 指定**专用目录**，不要指向项目根目录或与其他应用共享的目录。助手及密文独立于模型目录和 `auth.cwd`，默认放在用户主目录的 `.codex-relay-private` 下；也可用 `-CredentialBaseDirectory` 指定独立私有根目录，两棵目录不得互相包含。初始化私有存储时仅授予当前 Windows 用户与 SYSTEM 完全控制，不自动修复已存在但被改宽的私有目录。助手运行时只检查权限，不修复权限。
 
-**权限作用范围：**以上只读限制仅用于专用 `.codex-relay` 凭据/管理器数据，不是 Agent 项目工作区。工具不把项目目录改为只读，不修改 Codex 的工作区写入沙箱或审批；Agent 在项目中原有的修改权限保持不变。若确需让 Agent 改管理器数据，应由管理器提供明确操作，而不是让沙箱任意改写可解密 Key 的助手脚本。共享配置备份目录继续单独限制当前用户和 SYSTEM。
+私有目录的父路径也必须可信：若额外身份对任一父目录具有删除、删除子项、修改 ACL 或取得所有权权限，将拒绝部署或解密，防止通过重命名父目录、替换整个目录绕过子目录保护。对仅用于后代的继承规则按其实际作用路径检查；符号链接及重解析点仍拒绝。不要默认认为 `AppData`/`Temp` 安全，本机沙箱可能曾向这些路径赋权。
+
+持久认证使用系统 Windows PowerShell 的 `-EncodedCommand` 启动固定的安全引导代码（仅代码、路径及 Provider ID，不包含密钥），先建立无 BOM 的 UTF-8 标准错误通道，再检查私有目录权限并调用助手。这样脚本缺失、解析或执行策略错误不会直接泄露 PowerShell 本地编码的启动诊断，而是返回固定英文、含 stage/exception/HRESULT 的安全错误。标准输出仍仅含原始 UTF-8 密钥字节；不更改系统编码、代码页或执行策略。启动器编码参数不是加密机制。
+
+运行中的 App 可能缓存旧的 `auth.args`。更改认证路径或启动方式后，必须完全退出并重新打开 App；仅新建会话可能仍调用已退役的 `-File` 路径。不存在的旧脚本由 PowerShell 在执行任何助手代码前报错，管理器无法给这种已缓存的原生错误补设输出编码。
+
+旧版用户使用以下命令执行一次迁移（可同时指定原来的 `-DataDirectory`）：
+
+```powershell
+.\codex-relay.ps1 -MigrateLegacyCredentials
+```
+
+迁移先验证旧密文及助手来源，再把原始密文备份到私有目录，并更新默认 `config.toml` 和接入历史中登记的配置文件的受管 `auth` 字段。Provider ID、当前 Provider/默认模型、Profile、模型目录及无关配置保持不变；不接管被手改或外部拥有的认证。失败时回滚已更新的配置并保留旧密文，允许重试。成功后删除旧密文及旧助手入口，拒绝恢复会重新引用旧助手的配置快照。未登记的外部配置需另行更新，迁移前应关闭使用旧认证路径的 CLI/App；迁移后完全退出并重新打开 App 以加载新路径。
+
+普通管理器数据目录初始化仍仅对本机 `CodexSandboxUsers` 授予读取与执行（含 Synchronize），不影响其他项目目录。即使沙箱之后给模型目录或 `auth-runtime` 增加写权限，也不会通过继承扩大私有凭据的权限。默认不写运行日志，不记录网络正文或密钥。
+
+**权限作用范围：**以上限制用于专用管理器数据和独立凭据目录，不是 Agent 项目工作区。工具不把项目目录改为只读，不修改 Codex 的工作区写入沙箱或审批。共享配置备份目录继续单独限制当前用户和 SYSTEM；私有目录仍接受原有安全合约中的本机沙箱只读执行权限，但拒绝其写入与任何未知身份访问。
 
 API Key 用 Windows **DPAPI `CurrentUser`** 加密后 Base64 存储。解密通常需要原 Windows 用户和可用的 DPAPI 用户配置；只拷贝 JSON 到另一用户/设备不保证能解密。解密失败时可通过编辑菜单重录 Key。非 Windows 明确拒绝运行，不回退明文。磁盘写入先写同目录临时文件再原子替换，进程间互斥锁防止并发写覆盖；损坏 JSON 不自动覆盖，先提示备份修复。
 

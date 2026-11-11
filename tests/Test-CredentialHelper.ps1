@@ -34,6 +34,45 @@ function Invoke-CredentialTestHelper {
     if (-not $Arguments.Count) { $Arguments = $Config.Args }
     return Invoke-CredentialTestProcess $Config.Command $Arguments $Config.Cwd
 }
+
+Add-RelayTest 'CredentialHelper' 'Missing helper produces a safe UTF8 startup diagnostic without native File errors' {
+    $p = New-TestProvider
+    $config = Install-RelayCredentialHelper $p
+    $saved = $config.HelperPath + '.saved'
+    [IO.File]::Move($config.HelperPath, $saved)
+    try {
+        $result = Invoke-CredentialTestHelper $config
+        Assert-CredentialFailure $result -Stage HELPER_FILE_ACL -Reason 'Required credential file or directory was not found.' -Secrets @((Get-TestProviderKey $p), $p.EncryptedApiKey)
+        Assert-True ($result.Stderr -cnotmatch '[^\x00-\x7f]') 'Startup stderr must contain only fixed ASCII/UTF8 diagnostic text'
+        Assert-True (-not $result.Stderr.Contains($config.HelperPath)) 'Startup diagnostics must not echo paths or localized native errors'
+        Assert-True ($result.ExitCode -ne -196608) 'Native -File missing-script exit code must not escape the launcher'
+    } finally { [IO.File]::Move($saved, $config.HelperPath) }
+}
+
+Add-RelayTest 'CredentialHelper' 'Parse and execution-policy failures are readable and never echo script contents' {
+    $p = New-TestProvider
+    $config = Install-RelayCredentialHelper $p
+    $before = [IO.File]::ReadAllBytes($config.HelperPath)
+    try {
+        [IO.File]::WriteAllText($config.HelperPath, 'function broken { # SECRET_MUST_NOT_BE_ECHOED')
+        $broken = Invoke-CredentialTestHelper $config
+        Assert-CredentialFailure $broken -Stage HELPER_START -Secrets @('SECRET_MUST_NOT_BE_ECHOED', (Get-TestProviderKey $p))
+        Assert-True ($broken.Stderr -cnotmatch '[^\x00-\x7f]')
+    } finally { [IO.File]::WriteAllBytes($config.HelperPath, $before) }
+    $denied = Invoke-CredentialTestProcess $config.Command $config.Args $config.Cwd 25000 @{ PSExecutionPolicyPreference='Restricted' }
+    Assert-CredentialFailure $denied -Stage HELPER_START -Reason 'Access denied by Windows security or file permissions.'
+    Assert-True ($denied.Stderr -cnotmatch '[^\x00-\x7f]')
+}
+
+Add-RelayTest 'CredentialHelper' 'Encoded launcher keeps path input literal and fits the Windows command line' {
+    $p = New-TestProvider
+    $config = Install-RelayCredentialHelper $p
+    $path = Join-Path (Split-Path $config.HelperPath -Parent) "missing '; Write-Output INJECTED; #.ps1"
+    $arguments = @(New-RelayCredentialLauncherArguments -HelperPath $path -Root $config.StoreRoot -ProviderId $p.Id)
+    Assert-True (($config.Command.Length + ($arguments -join ' ').Length) -lt 32767)
+    $result = Invoke-CredentialTestHelper $config $arguments
+    Assert-CredentialFailure $result -Stage HELPER_FILE_ACL -Secrets @('INJECTED', (Get-TestProviderKey $p))
+}
 function Set-CredentialTestAcl {
     param([string]$Path, $Acl)
     # Modify DACL only: Set-Acl can attempt a privileged SACL write.
@@ -60,10 +99,11 @@ function Assert-CredentialFailure {
     }
     $diagnostic = [regex]::Match($Result.Stderr, '\ARelay credential helper failed\. stage=(?<stage>[A-Z][A-Z_]*); reason=(?<reason>[^\r\n]+); exception=(?<exception>[A-Za-z_][A-Za-z0-9_.+`]*); hresult=0x(?<hresult>[0-9A-Fa-f]{8})(?:\r?\n)?\z')
     Assert-True $diagnostic.Success 'Helper must emit one safe stage/reason/exception/HRESULT diagnostic on stderr'
-    $safeStages = @('WINDOWS_CHECK', 'DATA_PATH', 'ROOT_ACL', 'HELPER_DIRECTORY_ACL', 'HELPER_FILE_ACL', 'HELPER_LOCATION', 'PROVIDER_RECORD', 'DPAPI_ASSEMBLY', 'DPAPI_DECRYPT', 'TOKEN_VALIDATION', 'TOKEN_OUTPUT')
+    $safeStages = @('WINDOWS_CHECK', 'DATA_PATH', 'PARENT_ACL', 'ROOT_ACL', 'HELPER_DIRECTORY_ACL', 'HELPER_FILE_ACL', 'HELPER_START', 'HELPER_LOCATION', 'PROVIDER_RECORD', 'DPAPI_ASSEMBLY', 'DPAPI_DECRYPT', 'TOKEN_VALIDATION', 'TOKEN_OUTPUT')
     $safeReasons = @(
         'Credential helper requires Windows.', 'Invalid credential data path.', 'Invalid credential data root.',
         'Credential store must already exist.', 'Credential paths cannot contain reparse points.',
+        'Untrusted credential ancestor owner.', 'Credential ancestor ACL permits replacement by another identity.',
         'Credential root must have a protected ACL.', 'Credential paths must inherit the protected root ACL.',
         'Untrusted credential path owner.', 'Credential path ACL grants access to another identity.',
         'Credential path must grant current user full control.', 'CodexSandboxUsers may only have read and execute access, not write or administrative permissions.', 'Invalid credential Provider ID.',
@@ -77,6 +117,7 @@ function Assert-CredentialFailure {
         'Windows file or stream operation failed; the file may be locked or unavailable.',
         'Windows DPAPI assembly could not be loaded.',
         'Unexpected failure at the reported stage; use the exception type and HRESULT for diagnosis.'
+        'Credential launcher could not start the helper; check its installation and PowerShell execution policy.'
     )
     Assert-True ($safeStages -ccontains $diagnostic.Groups['stage'].Value) 'Helper exposed an unknown stage'
     Assert-True ($safeReasons -ccontains $diagnostic.Groups['reason'].Value) 'Helper exposed a non-whitelisted reason'
@@ -87,20 +128,21 @@ function Assert-CredentialFailure {
 
 Add-RelayTest 'CredentialHelper' 'preview has no side effects; install returns static absolute auth config' {
     $p = New-TestProvider
-    $before = [IO.File]::ReadAllText((Join-Path $script:RTCaseDirectory 'providers.json'))
+    $before = [IO.File]::ReadAllText((Get-RelayProviderStorePath))
     $preview = Get-RelayCredentialConfig $p
-    $directory = Join-Path $script:RTCaseDirectory 'credentials'
+    $directory = Join-Path (Get-RelayPrivatePaths).Root 'credentials'
     Assert-True (-not [IO.Directory]::Exists($directory))
-    Assert-Equal $preview.Args @('-NoProfile', '-NonInteractive', '-File', (Join-Path $directory 'credential-helper.ps1'), '-DataDirectory', $script:RTCaseDirectory, '-ProviderId', $p.Id)
+    Assert-Equal $preview.Args @(New-RelayCredentialLauncherArguments -HelperPath (Join-Path $directory 'credential-helper.ps1') -Root (Get-RelayPrivatePaths).Root -ProviderId $p.Id)
+    Assert-Equal $preview.Args[2] '-EncodedCommand'
     Assert-Equal $preview.TimeoutMs 15000
     Assert-Equal $preview.RefreshIntervalMs 300000
-    Assert-Equal $preview.Cwd $script:RTCaseDirectory
+    Assert-Equal $preview.Cwd (Join-Path $script:RTCaseDirectory 'auth-runtime')
     Assert-True ([IO.Path]::IsPathRooted($preview.Command))
     Assert-Equal ([IO.Path]::GetFileName($preview.Command)) 'powershell.exe'
     $config = Install-RelayCredentialHelper $p
     Assert-Equal $config $preview
-    Assert-Equal ([IO.File]::ReadAllText((Join-Path $script:RTCaseDirectory 'providers.json'))) $before
-    $helper = $config.Args[3]
+    Assert-Equal ([IO.File]::ReadAllText((Get-RelayProviderStorePath))) $before
+    $helper = $config.HelperPath
     $stamp = [IO.File]::GetLastWriteTimeUtc($helper)
     Assert-Equal (Install-RelayCredentialHelper $p) $config
     Assert-Equal ([IO.File]::GetLastWriteTimeUtc($helper)) $stamp
@@ -122,12 +164,12 @@ Add-RelayTest 'CredentialHelper' 'independent PS5 child emits exact UTF8 token o
     Assert-Equal $second.Stdout (Get-TestProviderKey $other)
     Assert-True ($first.Stdout -cne $second.Stdout)
     Assert-Equal $config.Command $otherConfig.Command
-    Assert-Equal $config.Args[3] $otherConfig.Args[3]
+    Assert-Equal $config.HelperPath $otherConfig.HelperPath
     Assert-True ($config.Args[-1] -cne $otherConfig.Args[-1])
     # Keys with non-ASCII prove byte encoding, not just the default OEM codepage.
     $unicodeKey = 'fixture-utf8-' + [char]0x4e2d + [char]0x6587 + '-' + [guid]::NewGuid().ToString('N')
     $p.EncryptedApiKey = Protect-RelayApiKey $unicodeKey
-    Write-RelayJson (Join-Path $script:RTCaseDirectory 'providers.json') @($p, $other)
+    Write-RelayJson (Get-RelayProviderStorePath) @($p, $other)
     $unicode = Invoke-CredentialTestHelper $config
     Assert-Equal $unicode.ExitCode 0; Assert-Equal $unicode.Stdout $unicodeKey; Assert-Equal $unicode.Stderr ''
     Assert-NoSecretInStore $first.Stdout
@@ -139,17 +181,17 @@ Add-RelayTest 'CredentialHelper' 'unknown invalid traversal uppercase and contro
     $p = New-TestProvider; $config = Install-RelayCredentialHelper $p
     $secrets = @((Get-TestProviderKey $p), $p.EncryptedApiKey)
     foreach ($id in @('../escape', ('relay_' + ('A' * 32)), ($p.Id + "`n"), ('relay_' + ('0' * 32)))) {
-        $arguments = [string[]]$config.Args.Clone(); $arguments[-1] = $id
+        $arguments = @(New-RelayCredentialLauncherArguments -HelperPath $config.HelperPath -Root $config.StoreRoot -ProviderId $id)
         $reason = if ($id -ceq ('relay_' + ('0' * 32))) { 'Credential provider not found.' } else { 'Invalid credential Provider ID.' }
         Assert-CredentialFailure (Invoke-CredentialTestHelper $config $arguments) -Reason $reason -Stage 'PROVIDER_RECORD' -ExceptionPattern '^System\.Management\.Automation\.RuntimeException$' -Secrets ($secrets + @($id))
         if ($id -ne ('relay_' + ('0' * 32))) { Assert-Throws { Get-RelayCredentialConfig ([pscustomobject]@{ Id = $id }) } 'Provider ID' | Out-Null }
     }
-    $argsCopy = [string[]]$config.Args.Clone(); $argsCopy[5] += "`n"
+    $argsCopy = @(New-RelayCredentialLauncherArguments -HelperPath $config.HelperPath -Root ($config.StoreRoot + "`n") -ProviderId $p.Id)
     Assert-CredentialFailure (Invoke-CredentialTestHelper $config $argsCopy) -Reason 'Invalid credential data path.' -Stage 'DATA_PATH' -Secrets $secrets
 }
 Add-RelayTest 'CredentialHelper' 'malformed JSON malicious ciphertext DPAPI failures duplicates and control tokens fail closed' {
     $p = New-TestProvider; $config = Install-RelayCredentialHelper $p
-    $store = Join-Path $script:RTCaseDirectory 'providers.json'
+    $store = Get-RelayProviderStorePath
     $original = [IO.File]::ReadAllText($store)
     $key = Get-TestProviderKey $p
     $originalCipher = $p.EncryptedApiKey
@@ -198,7 +240,7 @@ Add-RelayTest 'CredentialHelper' 'malformed JSON malicious ciphertext DPAPI fail
 }
 Add-RelayTest 'CredentialHelper' 'modified helper is preserved and refused rather than silently overwritten' {
     $p = New-TestProvider; $config = Install-RelayCredentialHelper $p
-    $path = $config.Args[3]
+    $path = $config.HelperPath
     [IO.File]::AppendAllText($path, "`r`n# user modification", (New-Object Text.UTF8Encoding($false)))
     $before = [IO.File]::ReadAllText($path)
     Assert-Throws { Install-RelayCredentialHelper $p } 'modified' | Out-Null
@@ -207,7 +249,7 @@ Add-RelayTest 'CredentialHelper' 'modified helper is preserved and refused rathe
 }
 Add-RelayTest 'CredentialHelper' 'unprotected root and non-inheriting or broad child ACL are refused without ACL repair' {
     $p = New-TestProvider; $config = Install-RelayCredentialHelper $p
-    $path = $config.Args[3]
+    $path = $config.HelperPath
     $secrets = @((Get-TestProviderKey $p), $p.EncryptedApiKey)
     $originalAcl = Get-Acl -LiteralPath $path
     $acl = Get-Acl -LiteralPath $path
@@ -222,15 +264,16 @@ Add-RelayTest 'CredentialHelper' 'unprotected root and non-inheriting or broad c
     Assert-CredentialFailure (Invoke-CredentialTestHelper $config) -Stage 'HELPER_FILE_ACL' -Reason 'Credential path ACL grants access to another identity.' -Secrets $secrets
     Assert-Throws { Install-RelayCredentialHelper $p } 'another identity' | Out-Null
     Set-CredentialTestAcl -Path $path -Acl $originalAcl
-    $rootAcl = Get-Acl -LiteralPath $script:RTCaseDirectory
+    $credentialRoot = (Get-RelayPrivatePaths).Root
+    $rootAcl = Get-Acl -LiteralPath $credentialRoot
     try {
-        $acl = Get-Acl -LiteralPath $script:RTCaseDirectory
+        $acl = Get-Acl -LiteralPath $credentialRoot
         $acl.SetAccessRuleProtection($false, $true)
-        Set-CredentialTestAcl -Path $script:RTCaseDirectory -Acl $acl
+        Set-CredentialTestAcl -Path $credentialRoot -Acl $acl
         Assert-CredentialFailure (Invoke-CredentialTestHelper $config) -Stage 'ROOT_ACL' -Reason 'Credential root must have a protected ACL.' -Secrets $secrets
         Assert-Throws { Get-RelayCredentialConfig $p } 'protected ACL' | Out-Null
-        Assert-True (-not (Get-Acl -LiteralPath $script:RTCaseDirectory).AreAccessRulesProtected)
-    } finally { Set-CredentialTestAcl -Path $script:RTCaseDirectory -Acl $rootAcl }
+        Assert-True (-not (Get-Acl -LiteralPath $credentialRoot).AreAccessRulesProtected)
+    } finally { Set-CredentialTestAcl -Path $credentialRoot -Acl $rootAcl }
 }
 Add-RelayTest 'CredentialHelper' 'junction in an ancestor or credentials directory is rejected' {
     $p = New-TestProvider; $config = Install-RelayCredentialHelper $p
@@ -238,14 +281,14 @@ Add-RelayTest 'CredentialHelper' 'junction in an ancestor or credentials directo
     $oldRoot = $script:RelayDataDirectory
     $link = Join-Path $outer 'junction'
     try {
-        New-Item -ItemType Junction -Path $link -Target $script:RTCaseDirectory -ErrorAction Stop | Out-Null
+        New-Item -ItemType Junction -Path $link -Target (Get-RelayPrivatePaths).Root -ErrorAction Stop | Out-Null
         $script:RelayDataDirectory = $link
         Assert-Throws { Get-RelayCredentialConfig $p } 'reparse' | Out-Null
-        $argsCopy = [string[]]$config.Args.Clone(); $argsCopy[5] = $link
+        $argsCopy = @(New-RelayCredentialLauncherArguments -HelperPath $config.HelperPath -Root $link -ProviderId $p.Id)
         Assert-CredentialFailure (Invoke-CredentialTestHelper $config $argsCopy)
         $script:RelayDataDirectory = $oldRoot
         # Same real helper invoked through a reparse ancestor must also fail.
-        $argsCopy = [string[]]$config.Args.Clone(); $argsCopy[3] = Join-Path $link 'credentials\credential-helper.ps1'
+        $argsCopy = @(New-RelayCredentialLauncherArguments -HelperPath (Join-Path $link 'credentials\credential-helper.ps1') -Root $config.StoreRoot -ProviderId $p.Id)
         Assert-CredentialFailure (Invoke-CredentialTestHelper $config $argsCopy)
     } finally {
         $script:RelayDataDirectory = $oldRoot

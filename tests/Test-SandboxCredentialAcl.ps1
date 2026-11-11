@@ -8,7 +8,7 @@ Add-RelayTest 'SandboxCredentialAcl' 'Local CodexSandboxUsers read execute is ac
     Assert-Equal $result.ExitCode 0
     Assert-Equal $result.Stdout (Get-TestProviderKey $p)
     Assert-Equal $result.Stderr ''
-    $root = $script:RTCaseDirectory
+    $root = (Get-RelayPrivatePaths).Root
     $original = Get-Acl -LiteralPath $root
     $changed = Get-Acl -LiteralPath $root
     $sid = New-Object Security.Principal.SecurityIdentifier($sandbox)
@@ -53,7 +53,7 @@ Add-RelayTest 'SandboxCredentialAcl' 'Store initialization preserves project ACL
 Add-RelayTest 'SandboxCredentialAcl' 'Sandbox read exception does not permit a different Windows identity' {
     $p = New-TestProvider
     $auth = Install-RelayCredentialHelper $p
-    $root = $script:RTCaseDirectory
+    $root = (Get-RelayPrivatePaths).Root
     $original = Get-Acl -LiteralPath $root
     $changed = Get-Acl -LiteralPath $root
     $everyone = New-Object Security.Principal.SecurityIdentifier('S-1-1-0')
@@ -64,4 +64,60 @@ Add-RelayTest 'SandboxCredentialAcl' 'Sandbox read exception does not permit a d
         $failure = Invoke-CredentialTestHelper $auth
         Assert-CredentialFailure $failure -Stage ROOT_ACL -Reason 'Credential path ACL grants access to another identity.' -Secrets @((Get-TestProviderKey $p), $p.EncryptedApiKey)
     } finally { Set-CredentialTestAcl $root $original }
+}
+
+Add-RelayTest 'SandboxCredentialAcl' 'Writable runtime and catalog roots do not grant access to private helper or ciphertext' {
+    $p = New-TestProvider
+    $auth = Install-RelayCredentialHelper $p
+    $private = Get-RelayPrivatePaths
+    Assert-True (-not $private.Root.StartsWith($script:RTCaseDirectory + '\', [StringComparison]::OrdinalIgnoreCase))
+    Assert-True (-not $auth.HelperPath.StartsWith($auth.Cwd + '\', [StringComparison]::OrdinalIgnoreCase))
+    Assert-True (-not [IO.File]::Exists((Join-Path $script:RTCaseDirectory 'providers.json')))
+    Assert-True (Test-Path -LiteralPath $private.Providers)
+    $rootAcl = Get-Acl -LiteralPath $script:RTCaseDirectory
+    $privateAcl = (Get-Acl -LiteralPath $private.Root).Sddl
+    $helperHash = (Get-FileHash -LiteralPath $auth.HelperPath).Hash
+    $everyone = New-Object Security.Principal.SecurityIdentifier('S-1-1-0')
+    $changed = Get-Acl -LiteralPath $script:RTCaseDirectory
+    [void]$changed.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule($everyone, 'Modify', 'ContainerInherit,ObjectInherit', 'None', 'Allow')))
+    try {
+        Set-CredentialTestAcl $script:RTCaseDirectory $changed
+        $result = Invoke-CredentialTestHelper $auth
+        Assert-Equal $result.ExitCode 0
+        Assert-Equal $result.Stderr ''
+        Assert-Equal $result.Stdout (Get-TestProviderKey $p)
+        Assert-Equal (Get-Acl -LiteralPath $private.Root).Sddl $privateAcl
+        Assert-Equal (Get-FileHash -LiteralPath $auth.HelperPath).Hash $helperHash
+        Assert-Equal @(Get-RelayProviders).Count 1
+    } finally { Set-CredentialTestAcl $script:RTCaseDirectory $rootAcl }
+}
+
+Add-RelayTest 'SandboxCredentialAcl' 'Parent delete-child rename and ACL takeover rights are refused even with a protected vault' {
+    $p = New-TestProvider
+    $auth = Install-RelayCredentialHelper $p
+    $private = Get-RelayPrivatePaths
+    $before = (Get-Acl -LiteralPath $private.Root).Sddl
+    $original = Get-Acl -LiteralPath $private.Base
+    foreach ($rights in @('DeleteSubdirectoriesAndFiles', 'Delete', 'ChangePermissions', 'TakeOwnership')) {
+        $changed = Get-Acl -LiteralPath $private.Base
+        $everyone = New-Object Security.Principal.SecurityIdentifier('S-1-1-0')
+        [void]$changed.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule($everyone, $rights, 'Allow')))
+        try {
+            Set-CredentialTestAcl $private.Base $changed
+            $result = Invoke-CredentialTestHelper $auth
+            Assert-CredentialFailure $result -Stage PARENT_ACL -Reason 'Credential ancestor ACL permits replacement by another identity.' -Secrets @((Get-TestProviderKey $p), $p.EncryptedApiKey)
+            [void](Assert-Throws { Install-RelayCredentialHelper $p } 'ancestor ACL')
+            Assert-Equal (Get-Acl -LiteralPath $private.Root).Sddl $before
+        } finally { Set-CredentialTestAcl $private.Base $original }
+    }
+}
+
+Add-RelayTest 'SandboxCredentialAcl' 'Private storage inside or above the runtime data tree is rejected' {
+    $saved = $script:RelayCredentialBaseDirectory
+    try {
+        foreach ($base in @($script:RTCaseDirectory, (Join-Path $script:RTCaseDirectory 'private'), (Split-Path $script:RTCaseDirectory -Parent))) {
+            $script:RelayCredentialBaseDirectory = $base
+            [void](Assert-Throws { Get-RelayPrivatePaths } 'separate')
+        }
+    } finally { $script:RelayCredentialBaseDirectory = $saved }
 }

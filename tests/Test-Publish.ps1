@@ -9,13 +9,13 @@ Add-RelayTest 'Publish' 'Publishing and restoring protects referenced provider a
     Assert-Equal $record.Status 'Applied'
     Assert-Equal @(Get-RelayCatalogModels $p) @('other', 'selected')
     Assert-True (Test-RelayProviderSharedReference $p)
-    $providersBefore = [IO.File]::ReadAllText((Join-Path $script:RTCaseDirectory 'providers.json'))
+    $providersBefore = [IO.File]::ReadAllText((Get-RelayProviderStorePath))
     Assert-Throws { Remove-RelayProvider $p } 'referenced' | Out-Null
     Assert-Throws { Clear-RelayCodexCatalog $p } 'referenced' | Out-Null
     $changed = $p | ConvertTo-Json | ConvertFrom-Json
     $changed.BaseUrl = 'https://different.invalid/v1'
     Assert-Throws { Save-RelayProvider $changed } 'referenced' | Out-Null
-    Assert-Equal ([IO.File]::ReadAllText((Join-Path $script:RTCaseDirectory 'providers.json'))) $providersBefore
+    Assert-Equal ([IO.File]::ReadAllText((Get-RelayProviderStorePath))) $providersBefore
     Assert-NoSecretInStore (Get-TestProviderKey $p)
     Restore-RelaySharedConfig -TransactionId $record.TransactionId | Out-Null
     Assert-True (-not [IO.File]::Exists($config))
