@@ -11,7 +11,9 @@ function Invoke-InteractionScenario {
         [string]$PreviewError = '',
         [string]$RestoreError = '',
         [object[]]$EffortSettings = @(),
-        [string]$EffortError = ''
+        [string]$EffortError = '',
+        [object[]]$ContextSettings = @(),
+        [string]$ContextError = ''
     )
     $state = [pscustomobject]@{
         Provider = [pscustomobject]@{ Id = 'interaction-only'; Name = '交互测试'; BaseUrl = 'https://interaction.invalid/v1' }
@@ -27,6 +29,9 @@ function Invoke-InteractionScenario {
         EffortPreviews = (New-Object Collections.ArrayList)
         EffortSettings = $EffortSettings
         EffortError = $EffortError
+        ContextPreviews = (New-Object Collections.ArrayList)
+        ContextSettings = $ContextSettings
+        ContextError = $ContextError
         Restores = (New-Object Collections.ArrayList)
         Events = (New-Object Collections.ArrayList)
         History = $History
@@ -94,6 +99,18 @@ function Invoke-InteractionScenario {
             if ($script:RTInteractionState.EffortError) { throw $script:RTInteractionState.EffortError }
             return $script:RTInteractionState.EffortSettings
         }
+        # Never enter the real context window UI or consume extra answers in legacy cases.
+        'Select-RelayContextSettingsUi' = {
+            param($Provider, [string[]]$Models)
+            Assert-True ([object]::ReferenceEquals($Provider, $script:RTInteractionState.Provider)) 'Context preview received the wrong provider'
+            [void]$script:RTInteractionState.Events.Add('ContextPreview')
+            [void]$script:RTInteractionState.ContextPreviews.Add([pscustomobject]@{
+                Provider = $Provider; Models = @($Models); Settings = $script:RTInteractionState.ContextSettings
+                ReadCount = $script:RTInteractionState.Prompts.Count
+            })
+            if ($script:RTInteractionState.ContextError) { throw $script:RTInteractionState.ContextError }
+            return $script:RTInteractionState.ContextSettings
+        }
         'Get-RelayCredentialConfig' = {
             param($Provider)
             Assert-Equal $Provider.Id $script:RTInteractionState.Provider.Id 'Credential preview received the wrong provider'
@@ -101,14 +118,14 @@ function Invoke-InteractionScenario {
             return $script:RTInteractionState.AuthConfig
         }
         'New-RelaySharedConfigPlan' = {
-            param($Provider, [string]$Model, [string]$CatalogPath, $AuthConfig, $EffortSettings)
+            param($Provider, [string]$Model, [string]$CatalogPath, $AuthConfig, $EffortSettings, $ContextSettings)
             Assert-Equal $Provider.Id $script:RTInteractionState.Provider.Id 'Shared preview received the wrong provider'
             Assert-Equal $CatalogPath 'interaction-only-models.json'
             Assert-True ([object]::ReferenceEquals($AuthConfig, $script:RTInteractionState.AuthConfig)) 'UI must pass the credential preview unchanged'
             [void]$script:RTInteractionState.Events.Add('SharedPreview')
             $plan = [pscustomobject]@{
                 ProviderId = $Provider.Id; Model = $Model; CatalogPath = $CatalogPath
-                AuthConfig = $AuthConfig; EffortSettings = $EffortSettings; ConfigPath = 'interaction-only-shared-config.toml'
+                AuthConfig = $AuthConfig; EffortSettings = $EffortSettings; ContextSettings = $ContextSettings; ConfigPath = 'interaction-only-shared-config.toml'
             }
             $script:RTInteractionState.Plan = $plan
             [void]$script:RTInteractionState.Previews.Add([pscustomobject]@{
@@ -119,13 +136,13 @@ function Invoke-InteractionScenario {
             return $plan
         }
         'Publish-RelayCodexModels' = {
-            param($Provider, [string[]]$Models, $Plan, $EffortSettings)
+            param($Provider, [string[]]$Models, $Plan, $EffortSettings, $ContextSettings)
             Assert-True ([object]::ReferenceEquals($Plan, $script:RTInteractionState.Plan)) 'UI must publish the exact previewed plan'
             Assert-True ($Models -ccontains $Plan.Model) 'Default model must be one of the explicitly selected models'
             Assert-Equal $script:RTInteractionState.Prompts[-1].Answer 'YES' 'Publish requires final exact YES'
             [void]$script:RTInteractionState.Events.Add('Publish')
             [void]$script:RTInteractionState.Imports.Add([pscustomobject]@{
-                ProviderId = $Provider.Id; Models = @($Models); Plan = $Plan; EffortSettings = $EffortSettings
+                ProviderId = $Provider.Id; Models = @($Models); Plan = $Plan; EffortSettings = $EffortSettings; ContextSettings = $ContextSettings
                 ReadCount = $script:RTInteractionState.Prompts.Count
             })
             return [pscustomobject]@{ MockOnly = $true; TransactionId = 'interaction-only-transaction' }
@@ -186,7 +203,7 @@ function Invoke-InteractionScenario {
             Result = $result; Output = @($state.Output.ToArray()); Prompts = @($state.Prompts.ToArray())
             Calls = @($state.Calls.ToArray()); Imports = @($state.Imports.ToArray()); Provider = $state.Provider
             Previews = @($state.Previews.ToArray()); Restores = @($state.Restores.ToArray())
-            EffortPreviews = @($state.EffortPreviews.ToArray())
+            EffortPreviews = @($state.EffortPreviews.ToArray()); ContextPreviews = @($state.ContextPreviews.ToArray())
             Events = @($state.Events.ToArray()); HistoryReads = $state.HistoryReads
         }
     } finally {
@@ -497,6 +514,53 @@ Add-RelayTest 'Interaction' 'Effort settings failure aborts before default, cred
     }
 }
 
+Add-RelayTest 'Interaction' 'Import passes selected models into context UI and forwards returned context settings to publish' {
+    $ctxSettings = @(
+        (New-RelayContextSetting -Model 'model-three' -ContextWindow 1000000 -MaxContextWindow 1000000 -EffectiveContextWindowPercent 95 -Source 'MANUAL' -Evidence 'manual-per-model')
+        (New-RelayContextSetting -Model 'model-one' -ContextWindow 1048576 -MaxContextWindow 1048576 -EffectiveContextWindowPercent 90 -AutoCompactTokenLimit 800000 -Source 'MODELS_METADATA' -Evidence 'models.context_window')
+    )
+    $session = Invoke-InteractionScenario -ContextSettings $ctxSettings -Answers @('2', '3,1', '00', '2', 'YES') -Body {
+        param($Provider)
+        Add-RelayCodexModelsUi $Provider
+    }
+    Assert-InteractionImportedModels $session @('model-three', 'model-one') 'model-one'
+    $ctxPreview = $session.ContextPreviews[0]
+    Assert-True ([object]::ReferenceEquals($ctxPreview.Provider, $session.Provider)) 'Context UI must receive the selected provider object'
+    Assert-Equal @($ctxPreview.Models) @('model-three', 'model-one') 'Context UI must receive the selected models in order'
+    Assert-Equal $ctxPreview.ReadCount 3 'Context settings must be collected before default model selection'
+    $publishedCtx = $session.Imports[0].ContextSettings
+    Assert-Equal $session.Previews[0].Plan.ContextSettings $publishedCtx 'Shared preview must check the same context settings as publish'
+    Assert-Equal @($publishedCtx) $ctxSettings 'Publish must receive all returned context settings in order'
+    for ($i = 0; $i -lt $ctxSettings.Count; $i++) {
+        Assert-True ([object]::ReferenceEquals($ctxPreview.Settings[$i], $ctxSettings[$i])) 'Context stub must retain the supplied settings object'
+        Assert-True ([object]::ReferenceEquals($publishedCtx[$i], $ctxSettings[$i])) 'Publish must receive the exact returned context settings object'
+    }
+    $effortIndex = [array]::IndexOf($session.Events, 'EffortPreview')
+    $ctxIndex = [array]::IndexOf($session.Events, 'ContextPreview')
+    $publishIndex = [array]::IndexOf($session.Events, 'Publish')
+    Assert-True ($effortIndex -ge 0 -and $ctxIndex -gt $effortIndex -and $publishIndex -gt $ctxIndex) 'Events must follow EffortPreview -> ContextPreview -> Publish'
+}
+
+Add-RelayTest 'Interaction' 'Context settings failure aborts before default, credential preview and publish' {
+    foreach ($answers in @(@('1', '2'), @('2', '3,1', '00'), @('3'))) {
+        $session = Invoke-InteractionScenario -ContextError 'fixture context settings failure' -Answers $answers -Body {
+            param($Provider)
+            [void](Assert-Throws { Add-RelayCodexModelsUi $Provider } 'fixture context settings failure')
+        }
+        Assert-Equal $session.ContextPreviews.Count 1
+        Assert-Equal $session.ContextPreviews[0].ReadCount $session.Prompts.Count
+        Assert-Equal @($session.Events | Select-Object -Last 1) @('ContextPreview')
+        Assert-Equal @($session.Events | Where-Object { $_ -in @('CredentialPreview', 'SharedPreview', 'Publish') }).Count 0
+        Assert-Equal @($session.Prompts | Where-Object { $_.Text -match '默认模型序号|输入 YES 确认' }).Count 0
+        Assert-Equal $session.Previews.Count 0
+        Assert-Equal $session.Imports.Count 0 'Context settings failure must never publish'
+        Assert-Equal $session.Restores.Count 0
+        Assert-Equal $session.Calls.Count 0 'Only the context stub may run; no API probes'
+        Assert-Equal $session.Result.Count 0
+        Assert-Equal @($session.Output | Where-Object { $_.Text -match '配置已写入' }).Count 0
+    }
+}
+
 Add-RelayTest 'Interaction' 'Shared preview conflicts abort before confirmation and perform zero writes' {
     foreach ($conflict in @('conflict: model_provider override', 'conflict: model_catalog_json override', 'conflict: profile override')) {
         $session = Invoke-InteractionScenario -PreviewError $conflict -Answers @('3', '2') -Body {
@@ -603,7 +667,7 @@ Add-RelayTest 'Interaction' 'Restore UI conflict propagates without claiming a s
 }
 
 Add-RelayTest 'Interaction' 'Mocks and selection state are restored even when a scenario throws' {
-    $names = @('Read-Host', 'Write-Host', 'Write-RelaySafe', 'Get-RelayModelCache', 'Get-RelayCompatibility', 'Test-RelayResponse', 'Get-RelayModels', 'New-RelayHttpClient', 'Write-RelayJson', 'Start-RelayCodex', 'Get-RelayCodexInfo', 'Get-RelayCatalogPaths', 'Add-RelayCodexModels', 'Select-RelayEffortSettingsUi', 'Get-RelayCredentialConfig', 'New-RelaySharedConfigPlan', 'Publish-RelayCodexModels', 'Get-RelaySharedConfigHistory', 'Restore-RelaySharedConfig', 'Install-RelayCredentialHelper', 'Read-RelayCredentialProvider', 'Unprotect-RelayApiKey', 'Read-RelaySecret', 'Invoke-RelaySharedConfigPlan', 'Read-RelayJson', 'Initialize-RelayStore', 'Invoke-RelayStoreLock', 'Invoke-WebRequest', 'Invoke-RestMethod')
+    $names = @('Read-Host', 'Write-Host', 'Write-RelaySafe', 'Get-RelayModelCache', 'Get-RelayCompatibility', 'Test-RelayResponse', 'Get-RelayModels', 'New-RelayHttpClient', 'Write-RelayJson', 'Start-RelayCodex', 'Get-RelayCodexInfo', 'Get-RelayCatalogPaths', 'Add-RelayCodexModels', 'Select-RelayEffortSettingsUi', 'Select-RelayContextSettingsUi', 'Get-RelayCredentialConfig', 'New-RelaySharedConfigPlan', 'Publish-RelayCodexModels', 'Get-RelaySharedConfigHistory', 'Restore-RelaySharedConfig', 'Install-RelayCredentialHelper', 'Read-RelayCredentialProvider', 'Unprotect-RelayApiKey', 'Read-RelaySecret', 'Invoke-RelaySharedConfigPlan', 'Read-RelayJson', 'Initialize-RelayStore', 'Invoke-RelayStoreLock', 'Invoke-WebRequest', 'Invoke-RestMethod')
     $before = @{}
     foreach ($name in $names) {
         $command = Get-Command $name -ErrorAction SilentlyContinue

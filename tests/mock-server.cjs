@@ -54,6 +54,16 @@ function fixture(req, res, name, pathname) {
       case 'models-nonstring': return json(res, 200, { data: [{ id: 123 }] });
       case 'models-b': return json(res, 200, { data: [{ id: 'provider-b-only' }] });
       case 'models-refreshed': return json(res, 200, { data: [{ id: 'model-new' }] });
+      case 'models-context': return json(res, 200, {
+        object: 'list',
+        data: [
+          { id: 'model-a', context_window: 1000000, max_context_window: 1000000, effective_context_window_percent: 95 },
+          { id: 'model-b', context_length: 200000 },
+          { id: 'model-openrouter', top_provider: { context_length: 1048576 } },
+          { id: 'model-unit-k', context_length: '256K' },
+          { id: 'model-no-meta' }
+        ]
+      });
       default: return json(res, 200, { object: 'list', data: [{ id: 'model-a', object: 'model' }, { id: 'model-b', object: 'model' }] });
     }
   }
@@ -61,6 +71,7 @@ function fixture(req, res, name, pathname) {
     if (name === 'json-response') return json(res, 200, { id: 'resp_json', status: 'completed', output: [{ type: 'message', content: [{ type: 'output_text', text: 'not a stream' }] }] });
     res.writeHead(200, { 'content-type': 'text/event-stream; charset=utf-8', 'cache-control': 'no-cache', connection: 'keep-alive' });
     res.flushHeaders();
+    const textSse = text => created + event('response.output_text.delta', { type: 'response.output_text.delta', delta: text }) + completed + 'data: [DONE]\r\n\r\n';
     switch (name) {
       case 'sse-lifecycle': return stream(res, ': heartbeat\r\n\r\n' + created + progress + completed + 'data: [DONE]\r\n\r\n');
       case 'sse-delta-only': return stream(res, created + delta + 'data: [DONE]\r\n\r\n');
@@ -79,6 +90,11 @@ function fixture(req, res, name, pathname) {
         timer.unref();
         return;
       }
+      case 'sse-context-json': return stream(res, textSse(JSON.stringify({ models: [{ id: 'model-a', context_window: 1000000 }, { id: 'model-b', context_window: 200000 }, { id: 'model-no-meta', context_window: 512000 }] })));
+      case 'sse-context-map': return stream(res, textSse(JSON.stringify({ models: { 'model-a': 1000000, 'model-unit-k': '256K', 'model-no-meta': null } })));
+      case 'sse-context-scalar': return stream(res, textSse('1000000'));
+      case 'sse-context-unit': return stream(res, textSse('1M'));
+      case 'sse-context-invalid': return stream(res, textSse('Sorry, I think around 256K tokens.'));
       default: return stream(res, ': mock heartbeat\r\n\r\n' + created + delta + completed + 'data: [DONE]\r\n\r\n');
     }
   }

@@ -644,9 +644,20 @@ function Get-RelaySharedManagedHash {
     param([string]$Text)
     return Get-RelaySharedHash ([Text.Encoding]::UTF8.GetBytes($Text))
 }
+function Assert-RelayContextConfigOverrides {
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Text)
+    Initialize-RelayTomlEditor
+    $doc = [RelaySharedToml.Document]::Parse($Text)
+    foreach ($entry in $doc.Entries) {
+        if ($entry.Path -cin @('model_context_window', 'model_auto_compact_token_limit')) {
+            throw ('共享 config.toml 的全局 ' + $entry.Path + ' 会覆盖分模型上下文设置；请显式移除此全局设置后重试（本次未修改配置）。')
+        }
+    }
+}
+
 function New-RelaySharedConfigPlan {
     param([Parameter(Mandatory)]$Provider, [Parameter(Mandatory)][string]$Model, [string]$ConfigPath,
-          [Parameter(Mandatory)][string]$CatalogPath, [Parameter(Mandatory)]$AuthConfig, [object[]]$EffortSettings = @())
+          [Parameter(Mandatory)][string]$CatalogPath, [Parameter(Mandatory)]$AuthConfig, [object[]]$EffortSettings = @(), [object[]]$ContextSettings = @())
     if ($Provider.Id -cnotmatch '^relay_[a-f0-9]{32}$') { throw 'Provider ID is invalid.' }
     foreach ($v in @($Model, $Provider.Name, $Provider.BaseUrl)) { if ([string]::IsNullOrWhiteSpace($v) -or $v -match '[\x00-\x1f\x7f]') { throw 'Model/provider values must be nonempty and contain no control characters.' } }
     $uri = $null
@@ -660,6 +671,7 @@ function New-RelaySharedConfigPlan {
     $snap = Get-RelaySharedSnapshot $ConfigPath; $text = ConvertFrom-RelaySharedBytes $snap.Bytes
     Initialize-RelayTomlEditor
     $doc = [RelaySharedToml.Document]::Parse($text)
+    if ($ContextSettings.Count) { Assert-RelayContextConfigOverrides -Text $text }
     $sep = [string][char]31; $prefix = 'model_providers' + $sep + $Provider.Id; $authPrefix = $prefix + $sep + 'auth'
     $nl = "`n"; if ($text.Contains("`r`n")) { $nl = "`r`n" }
     $values = New-Object Collections.Specialized.OrderedDictionary ([StringComparer]::Ordinal)
@@ -902,6 +914,18 @@ function Assert-RelayCatalogDocument {
         $hasLegacy = $entry.PSObject.Properties['base_instructions'] -and $entry.base_instructions -is [string]
         $hasTemplate = $entry.PSObject.Properties['model_messages'] -and $entry.model_messages -and $entry.model_messages.PSObject.Properties['instructions_template'] -and $entry.model_messages.instructions_template -is [string]
         if (-not $hasLegacy -and -not $hasTemplate) { throw 'Catalog 缺少官方要求的 instructions_template/base_instructions。' }
+        foreach ($ctxField in @('context_window', 'max_context_window', 'auto_compact_token_limit')) {
+            if ($entry.PSObject.Properties[$ctxField] -and $null -ne $entry.$ctxField) {
+                if (($entry.$ctxField -isnot [int] -and $entry.$ctxField -isnot [long]) -or $entry.$ctxField -le 0) {
+                    throw ('Catalog ' + $ctxField + ' 必须为正整数或 null。')
+                }
+            }
+        }
+        if ($entry.PSObject.Properties['effective_context_window_percent'] -and $null -ne $entry.effective_context_window_percent) {
+            if (($entry.effective_context_window_percent -isnot [int] -and $entry.effective_context_window_percent -isnot [long]) -or $entry.effective_context_window_percent -lt 1 -or $entry.effective_context_window_percent -gt 100) {
+                throw 'Catalog effective_context_window_percent 必须为 1 到 100 的整数或 null。'
+            }
+        }
     }
 }
 
@@ -964,6 +988,13 @@ function Update-RelayCatalogOfficialTemplates {
                 }
                 $entryEvidence = @($entry.supported_reasoning_levels | Where-Object { $_.PSObject.Properties['description'] -and $_.description -like '*API*' })
                 if ($entryEvidence.Count) { $replacement | Add-Member NoteProperty relay_effort_evidence 'API_ACCEPTED' -Force }
+                if ($entry.PSObject.Properties['relay_context_evidence'] -and $null -ne $entry.relay_context_evidence) {
+                    foreach ($ctxField in @('context_window', 'max_context_window', 'effective_context_window_percent', 'auto_compact_token_limit', 'relay_context_evidence')) {
+                        if ($entry.PSObject.Properties[$ctxField]) {
+                            $replacement | Add-Member NoteProperty $ctxField $entry.PSObject.Properties[$ctxField].Value -Force
+                        }
+                    }
+                }
                 $replacement
             }
         )
@@ -1171,7 +1202,7 @@ function Read-RelayLimitedBody {
     } finally { $reader.Dispose() }
 }
 
-function Get-RelayModels {
+function Invoke-RelayModelsListRequest {
     param([Parameter(Mandatory)]$Provider, [ValidateRange(1, 300)][int]$TimeoutSeconds = 30)
     $key = Unprotect-RelayApiKey $Provider.EncryptedApiKey
     $client = New-RelayHttpClient $key
@@ -1190,31 +1221,48 @@ function Get-RelayModels {
         }
         try { $parsed = $body | ConvertFrom-Json -ErrorAction Stop } catch { throw '模型列表不是有效 JSON；请检查 API 根地址，可能返回了 HTML 页面。' }
         if (-not $parsed -or -not $parsed.PSObject.Properties['data'] -or $parsed.data -isnot [Array]) { throw '模型列表 JSON 格式错误：预期包含 data 数组及 data[].id。' }
-        $seen = New-Object 'Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
-        $models = @(
-            foreach ($entry in $parsed.data) {
-                if (-not $entry -or -not $entry.PSObject.Properties['id'] -or $entry.id -isnot [string] -or [string]::IsNullOrWhiteSpace($entry.id) -or $entry.id -match '[\x00-\x1f\x7f]') { throw '模型列表 JSON 格式错误：每一项都必须包含非空字符串 id，且不得包含控制字符。' }
-                if ($seen.Add($entry.id)) { $entry.id }
+        foreach ($entry in $parsed.data) {
+            if (-not $entry -or -not $entry.PSObject.Properties['id'] -or $entry.id -isnot [string] -or [string]::IsNullOrWhiteSpace($entry.id) -or $entry.id -match '[\x00-\x1f\x7f]') {
+                throw '模型列表 JSON 格式错误：每一项都必须包含非空字符串 id，且不得包含控制字符。'
             }
-        )
-        if (-not $models.Count) { throw '模型列表为空：Provider 仍已保存，可以使用上次缓存或手动输入模型 ID。' }
-        $cache = [pscustomobject]@{ ProviderId = $Provider.Id; FetchedAt = [DateTime]::UtcNow.ToString('o'); Models = @($models) }
-        Invoke-RelayStoreLock { Write-RelayJson -Path (Get-RelayCachePath $Provider models) -Value $cache }
-        return $models
+        }
+        return [pscustomobject]@{ Items = @($parsed.data) }
     } finally {
         $cts.Cancel(); if ($response) { $response.Dispose() }; $client.Dispose(); $cts.Dispose(); $key = $null
     }
 }
 
+function Get-RelayModels {
+    param([Parameter(Mandatory)]$Provider, [ValidateRange(1, 300)][int]$TimeoutSeconds = 30)
+    $list = Invoke-RelayModelsListRequest -Provider $Provider -TimeoutSeconds $TimeoutSeconds
+    $seen = New-Object 'Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
+    $models = @(
+        foreach ($entry in $list.Items) {
+            if ($seen.Add($entry.id)) { $entry.id }
+        }
+    )
+    if (-not $models.Count) { throw '模型列表为空：Provider 仍已保存，可以使用上次缓存或手动输入模型 ID。' }
+    $cache = [pscustomobject]@{ ProviderId = $Provider.Id; FetchedAt = [DateTime]::UtcNow.ToString('o'); Models = @($models) }
+    Invoke-RelayStoreLock { Write-RelayJson -Path (Get-RelayCachePath $Provider models) -Value $cache }
+    return $models
+}
+
 function Read-RelaySse {
-    param($Response, [datetime]$Deadline)
+    param($Response, [datetime]$Deadline, [switch]$CollectText)
+    $emptyResult = {
+        param([string]$Status, [string]$Message, [object[]]$EventsList)
+        $obj = [pscustomobject]@{ Status = $Status; Message = $Message; Events = @($EventsList) }
+        if ($CollectText) { $obj | Add-Member NoteProperty Text '' }
+        return $obj
+    }
     if (-not $Response.Content.Headers.ContentType -or $Response.Content.Headers.ContentType.MediaType -ne 'text/event-stream') {
-        return [pscustomobject]@{ Status = 'INCOMPATIBLE'; Message = 'HTTP 成功，但 Content-Type 不是 text/event-stream，不能作为 Responses 流。'; Events = @() }
+        return (& $emptyResult 'INCOMPATIBLE' 'HTTP 成功，但 Content-Type 不是 text/event-stream，不能作为 Responses 流。' @())
     }
     $stream = Wait-RelayTask ($Response.Content.ReadAsStreamAsync()) $Deadline
     $reader = New-Object IO.StreamReader($stream)
     $events = New-Object 'Collections.Generic.List[string]'
     $eventName = ''; $data = New-Object Text.StringBuilder
+    $textBuilder = New-Object Text.StringBuilder
     $receivedText = $false; $lifecycle = $false; $total = 0
     try {
         while ($true) {
@@ -1237,30 +1285,37 @@ function Read-RelaySse {
                     $data.Clear() | Out-Null
                     if ($payload -eq '[DONE]') { break }
                     try { $obj = $payload | ConvertFrom-Json -ErrorAction Stop } catch {
-                        return [pscustomobject]@{ Status = 'INCOMPATIBLE'; Message = 'SSE data 不是有效 JSON。'; Events = @($events.ToArray()) }
+                        return (& $emptyResult 'INCOMPATIBLE' 'SSE data 不是有效 JSON。' $events.ToArray())
                     }
                     $type = ''
                     if ($obj -and $obj.PSObject.Properties['type']) { $type = [string]$obj.type }
                     if (-not $type -or ($eventName -and $type -cne $eventName)) {
-                        return [pscustomobject]@{ Status = 'INCOMPATIBLE'; Message = '缺失 Responses 事件 type，或 event 与 data.type 不一致。'; Events = @($events.ToArray()) }
+                        return (& $emptyResult 'INCOMPATIBLE' '缺失 Responses 事件 type，或 event 与 data.type 不一致。' $events.ToArray())
                     }
                     if ($events.Count -lt 512) { $events.Add($type) }
                     if ($type -in @('response.created', 'response.in_progress')) { $lifecycle = $true }
                     if ($type -eq 'response.output_text.delta') {
                         if (-not $obj.PSObject.Properties['delta'] -or $obj.delta -isnot [string]) {
-                            return [pscustomobject]@{ Status = 'INCOMPATIBLE'; Message = 'output_text.delta 缺少字符串 delta。'; Events = @($events.ToArray()) }
+                            return (& $emptyResult 'INCOMPATIBLE' 'output_text.delta 缺少字符串 delta。' $events.ToArray())
                         }
-                        if ($obj.delta.Length) { $receivedText = $true }
+                        if ($obj.delta.Length) {
+                            $receivedText = $true
+                            if ($CollectText -and ($textBuilder.Length + $obj.delta.Length) -le 262144) {
+                                [void]$textBuilder.Append($obj.delta)
+                            }
+                        }
                     }
                     if ($type -in @('response.failed', 'error', 'response.incomplete')) {
                         $classification = Get-RelayHttpClassification 400 $payload
-                        return [pscustomobject]@{ Status = $classification.Status; Message = ('Responses 流返回失败事件：' + $type + '。' + $classification.Message); Events = @($events.ToArray()) }
+                        return (& $emptyResult $classification.Status ('Responses 流返回失败事件：' + $type + '。' + $classification.Message) $events.ToArray())
                     }
                     if ($type -eq 'response.completed') {
                         if (-not $obj.PSObject.Properties['response'] -or -not $obj.response -or -not $obj.response.PSObject.Properties['status'] -or $obj.response.status -ne 'completed' -or -not $receivedText -or -not $lifecycle) {
-                            return [pscustomobject]@{ Status = 'UNKNOWN'; Message = '收到 completed，但缺少 completed 状态、生命周期或文本增量，不能确认兼容。'; Events = @($events.ToArray()) }
+                            return (& $emptyResult 'UNKNOWN' '收到 completed，但缺少 completed 状态、生命周期或文本增量，不能确认兼容。' $events.ToArray())
                         }
-                        return [pscustomobject]@{ Status = 'COMPATIBLE'; Message = '已验证 Responses SSE 生命周期、文本增量及成功终止事件；不代表工具调用和多轮对话完全兼容。'; Events = @($events.ToArray()) }
+                        $doneObj = [pscustomobject]@{ Status = 'COMPATIBLE'; Message = '已验证 Responses SSE 生命周期、文本增量及成功终止事件；不代表工具调用和多轮对话完全兼容。'; Events = @($events.ToArray()) }
+                        if ($CollectText) { $doneObj | Add-Member NoteProperty Text $textBuilder.ToString() }
+                        return $doneObj
                     }
                 }
                 $eventName = ''
@@ -1271,13 +1326,19 @@ function Read-RelaySse {
             }
             if ($eof) { break }
         }
-        return [pscustomobject]@{ Status = 'UNKNOWN'; Message = '流提前结束：未收到有效 response.completed，不会标记为已兼容。'; Events = @($events.ToArray()) }
+        return (& $emptyResult 'UNKNOWN' '流提前结束：未收到有效 response.completed，不会标记为已兼容。' $events.ToArray())
     } finally { $reader.Dispose() }
 }
 
-function Test-RelayResponse {
-    param([Parameter(Mandatory)]$Provider, [Parameter(Mandatory)][string]$Model, [ValidateRange(1, 300)][int]$TimeoutSeconds = 30,
-          [ValidateSet('none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max')][string]$ReasoningEffort)
+function Invoke-RelayResponsesProbe {
+    param(
+        [Parameter(Mandatory)]$Provider,
+        [Parameter(Mandatory)][string]$Model,
+        [Parameter(Mandatory)][string]$InputText,
+        [ValidateRange(1, 300)][int]$TimeoutSeconds = 30,
+        [ValidateSet('', 'none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max')][string]$ReasoningEffort = '',
+        [switch]$CollectText
+    )
     $key = Unprotect-RelayApiKey $Provider.EncryptedApiKey
     $client = New-RelayHttpClient $key
     $cts = New-Object Threading.CancellationTokenSource
@@ -1286,7 +1347,7 @@ function Test-RelayResponse {
     $response = $null; $request = $null
     try {
         $request = New-Object Net.Http.HttpRequestMessage([Net.Http.HttpMethod]::Post, ($Provider.BaseUrl + '/responses'))
-        $bodyObject = @{ model = $Model; input = 'Reply with exactly: OK'; stream = $true }
+        $bodyObject = @{ model = $Model; input = $InputText; stream = $true }
         if ($ReasoningEffort) { $bodyObject['reasoning'] = @{ effort = $ReasoningEffort } }
         $json = $bodyObject | ConvertTo-Json -Depth 5 -Compress
         $request.Content = New-Object Net.Http.StringContent($json, [Text.Encoding]::UTF8, 'application/json')
@@ -1297,22 +1358,431 @@ function Test-RelayResponse {
                 $body = Read-RelayLimitedBody $response $deadline 65536
                 $info = Get-RelayHttpClassification ([int]$response.StatusCode) $body
                 $result = [pscustomobject]@{ Status = $info.Status; Message = $info.Message; Events = @() }
-            } else { $result = Read-RelaySse $response $deadline }
-        } catch { $result = [pscustomobject]@{ Status = 'NETWORK_ERROR'; Message = Get-RelayNetworkMessage $_; Events = @() } }
-        $record = [pscustomobject]@{ ProviderId = $Provider.Id; Model = $Model; TestedAt = [DateTime]::UtcNow.ToString('o'); Status = $result.Status; Message = $result.Message; Events = @($result.Events) }
-        if ($ReasoningEffort) {
-            $record | Add-Member NoteProperty ReasoningEffort $ReasoningEffort
-            $record | Add-Member NoteProperty Evidence 'REQUEST_ACCEPTANCE_ONLY'
-            Invoke-RelayStoreLock {
-                $path = Get-RelayCachePath -Provider $Provider -Kind effort
-                $old = Read-RelayJson -Path $path -Default @()
-                $records = @($old | Where-Object { $_.Model -cne $Model -or $_.ReasoningEffort -cne $ReasoningEffort }) + @($record)
-                Write-RelayJson -Path $path -Value @($records)
+                if ($CollectText) { $result | Add-Member NoteProperty Text '' }
+            } else {
+                $result = Read-RelaySse $response $deadline -CollectText:$CollectText
             }
-        } else { Save-RelayCompatibility $Provider $record }
-        return $record
+        } catch {
+            $result = [pscustomobject]@{ Status = 'NETWORK_ERROR'; Message = Get-RelayNetworkMessage $_; Events = @() }
+            if ($CollectText) { $result | Add-Member NoteProperty Text '' }
+        }
+        return $result
     } finally {
         $cts.Cancel(); if ($response) { $response.Dispose() }; if ($request) { $request.Dispose() }; $client.Dispose(); $cts.Dispose(); $key = $null
+    }
+}
+
+function Test-RelayResponse {
+    param([Parameter(Mandatory)]$Provider, [Parameter(Mandatory)][string]$Model, [ValidateRange(1, 300)][int]$TimeoutSeconds = 30,
+          [ValidateSet('none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max')][string]$ReasoningEffort)
+    $result = Invoke-RelayResponsesProbe -Provider $Provider -Model $Model -InputText 'Reply with exactly: OK' -TimeoutSeconds $TimeoutSeconds -ReasoningEffort $ReasoningEffort
+    $record = [pscustomobject]@{ ProviderId = $Provider.Id; Model = $Model; TestedAt = [DateTime]::UtcNow.ToString('o'); Status = $result.Status; Message = $result.Message; Events = @($result.Events) }
+    if ($ReasoningEffort) {
+        $record | Add-Member NoteProperty ReasoningEffort $ReasoningEffort
+        $record | Add-Member NoteProperty Evidence 'REQUEST_ACCEPTANCE_ONLY'
+        Invoke-RelayStoreLock {
+            $path = Get-RelayCachePath -Provider $Provider -Kind effort
+            $old = Read-RelayJson -Path $path -Default @()
+            $records = @($old | Where-Object { $_.Model -cne $Model -or $_.ReasoningEffort -cne $ReasoningEffort }) + @($record)
+            Write-RelayJson -Path $path -Value @($records)
+        }
+    } else { Save-RelayCompatibility $Provider $record }
+    return $record
+}
+
+function ConvertTo-RelayRawPositiveInt64 {
+    param([AllowNull()][object]$Value, [string]$Label = '上下文窗口')
+    if ($null -eq $Value) { throw ($Label + ' 不能为空，请输入正整数原始数字（不可使用 K/M 单位）。') }
+    if ($Value -is [bool]) { throw ($Label + ' 必须是正整数，不能为布尔值。') }
+    if ($Value -is [int] -or $Value -is [long]) {
+        if ($Value -le 0) { throw ($Label + ' 必须是大于 0 的正整数。') }
+        return [int64]$Value
+    }
+    if ($Value -is [string]) {
+        $trimmed = $Value.Trim()
+        if ([string]::IsNullOrWhiteSpace($trimmed)) { throw ($Label + ' 不能为空，请输入正整数原始数字（不可使用 K/M 单位）。') }
+        if ($trimmed -match '[a-zA-Z]') { throw ($Label + ' 不允许使用 K、M 等单位或字母，请输入原始正整数（例如 1000000 或 272000）。') }
+        if ($trimmed -cnotmatch '^\d+$') { throw ($Label + ' 必须仅包含原始正整数数字（不可包含单位、小数点、逗号或空格）。') }
+        $parsed = [int64]0
+        if (-not [int64]::TryParse($trimmed, [Globalization.NumberStyles]::None, [Globalization.CultureInfo]::InvariantCulture, [ref]$parsed) -or $parsed -le 0) {
+            throw ($Label + ' 必须是大于 0 的有效 64 位整数。')
+        }
+        return [int64]$parsed
+    }
+    throw ($Label + ' 必须是原始正整数，不支持小数或非数字类型。')
+}
+
+function ConvertTo-RelayContextWindowValue {
+    param([AllowNull()][object]$Value)
+    return (ConvertTo-RelayRawPositiveInt64 -Value $Value -Label '上下文窗口')
+}
+
+function ConvertTo-RelayEffectivePercentValue {
+    param([AllowNull()][object]$Value)
+    $parsed = ConvertTo-RelayRawPositiveInt64 -Value $Value -Label '有效上下文比例'
+    if ($parsed -lt 1 -or $parsed -gt 100) { throw '有效上下文比例必须是 1 到 100 的整数（例如 95）。' }
+    return [int]$parsed
+}
+
+function New-RelayContextSetting {
+    param(
+        [Parameter(Mandatory)][string]$Model,
+        [Parameter(Mandatory)][object]$ContextWindow,
+        [AllowNull()][object]$MaxContextWindow = $null,
+        [AllowNull()][object]$EffectiveContextWindowPercent = 95,
+        [AllowNull()][object]$AutoCompactTokenLimit = $null,
+        [ValidateSet('MANUAL', 'MODELS_METADATA', 'RESPONSES_QUERY')][string]$Source = 'MANUAL',
+        [string]$Evidence = ''
+    )
+    if ([string]::IsNullOrWhiteSpace($Model) -or $Model -match '[\x00-\x1f\x7f]') { throw '模型 ID 不能为空或包含控制字符。' }
+    $ctx = ConvertTo-RelayContextWindowValue $ContextWindow
+    $maxCtx = $ctx
+    if ($null -ne $MaxContextWindow -and ([string]$MaxContextWindow).Trim() -ne '') {
+        $maxCtx = ConvertTo-RelayContextWindowValue $MaxContextWindow
+        if ($maxCtx -lt $ctx) { throw 'max_context_window 不能小于 context_window。' }
+    }
+    $eff = $null
+    if ($null -ne $EffectiveContextWindowPercent -and ([string]$EffectiveContextWindowPercent).Trim() -ne '') {
+        $eff = ConvertTo-RelayEffectivePercentValue $EffectiveContextWindowPercent
+    }
+    $compact = $null
+    if ($null -ne $AutoCompactTokenLimit -and ([string]$AutoCompactTokenLimit).Trim() -ne '') {
+        $compact = ConvertTo-RelayRawPositiveInt64 -Value $AutoCompactTokenLimit -Label 'auto_compact_token_limit'
+        if ($compact -gt $ctx) { throw 'auto_compact_token_limit 不能大于 context_window。' }
+    }
+    return [pscustomobject]@{
+        Model                         = $Model
+        ContextWindow                 = [int64]$ctx
+        MaxContextWindow              = [int64]$maxCtx
+        EffectiveContextWindowPercent = $eff
+        AutoCompactTokenLimit         = $compact
+        Source                        = $Source
+        Evidence                      = $Evidence
+    }
+}
+
+function Resolve-RelayCatalogMetadataContext {
+    param([Parameter(Mandatory)]$Item, [Parameter(Mandatory)][string]$Model)
+    $directFields = @('context_window', 'context_length', 'max_context_length', 'max_context_window', 'input_token_limit', 'max_input_tokens', 'max_model_len', 'n_ctx')
+    $nestedPaths = @(
+        @('top_provider', 'context_length'),
+        @('top_provider', 'context_window'),
+        @('limits', 'context_window'),
+        @('limits', 'context_length'),
+        @('limits', 'max_context_tokens'),
+        @('capabilities', 'limits', 'max_context_window_tokens')
+    )
+    $candidates = New-Object 'Collections.Generic.List[object]'
+    foreach ($field in $directFields) {
+        if ($Item.PSObject.Properties[$field] -and $null -ne $Item.$field) {
+            $candidates.Add([pscustomobject]@{ Name = $field; Raw = $Item.$field })
+        }
+    }
+    foreach ($path in $nestedPaths) {
+        $cursor = $Item
+        $ok = $true
+        foreach ($seg in $path) {
+            if ($null -eq $cursor -or -not $cursor.PSObject.Properties[$seg]) { $ok = $false; break }
+            $cursor = $cursor.$seg
+        }
+        if ($ok -and $null -ne $cursor) {
+            $candidates.Add([pscustomobject]@{ Name = ($path -join '.'); Raw = $cursor })
+        }
+    }
+    $firstError = ''
+    foreach ($cand in $candidates) {
+        try {
+            $ctx = ConvertTo-RelayContextWindowValue $cand.Raw
+            $maxCtx = $ctx
+            if ($Item.PSObject.Properties['max_context_window'] -and $null -ne $Item.max_context_window) {
+                try {
+                    $m = ConvertTo-RelayContextWindowValue $Item.max_context_window
+                    if ($m -gt $maxCtx) { $maxCtx = $m }
+                } catch { }
+            }
+            $eff = 95
+            if ($Item.PSObject.Properties['effective_context_window_percent'] -and $null -ne $Item.effective_context_window_percent) {
+                try { $eff = ConvertTo-RelayEffectivePercentValue $Item.effective_context_window_percent } catch { $eff = 95 }
+            }
+            $compact = $null
+            if ($Item.PSObject.Properties['auto_compact_token_limit'] -and $null -ne $Item.auto_compact_token_limit) {
+                try {
+                    $c = ConvertTo-RelayRawPositiveInt64 $Item.auto_compact_token_limit -Label 'auto_compact_token_limit'
+                    if ($c -le $ctx) { $compact = $c }
+                } catch { }
+            }
+            $setting = New-RelayContextSetting -Model $Model -ContextWindow $ctx -MaxContextWindow $maxCtx -EffectiveContextWindowPercent $eff -AutoCompactTokenLimit $compact -Source 'MODELS_METADATA' -Evidence ('/models:' + $cand.Name)
+            return [pscustomobject]@{ Found = $true; Setting = $setting; Error = '' }
+        } catch {
+            if (-not $firstError) { $firstError = ($cand.Name + ': ' + $_.Exception.Message) }
+        }
+    }
+    return [pscustomobject]@{ Found = $false; Setting = $null; Error = $firstError }
+}
+
+function Get-RelayContextFromModels {
+    param([Parameter(Mandatory)]$Provider, [Parameter(Mandatory)][string[]]$Models, [ValidateRange(1, 300)][int]$TimeoutSeconds = 30)
+    $seen = New-Object 'Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
+    $targets = @($Models | Where-Object { -not [string]::IsNullOrWhiteSpace($_) -and $seen.Add($_) })
+    if (-not $targets.Count) { throw '请至少提供一个模型 ID。' }
+    $list = Invoke-RelayModelsListRequest -Provider $Provider -TimeoutSeconds $TimeoutSeconds
+    $byId = New-Object 'Collections.Generic.Dictionary[string,object]' ([StringComparer]::Ordinal)
+    foreach ($item in $list.Items) {
+        if (-not $byId.ContainsKey($item.id)) { $byId[$item.id] = $item }
+    }
+    $found = New-Object 'Collections.Generic.List[object]'
+    $missing = New-Object 'Collections.Generic.List[string]'
+    $rejected = New-Object 'Collections.Generic.List[object]'
+    foreach ($target in $targets) {
+        if ($byId.ContainsKey($target)) {
+            $res = Resolve-RelayCatalogMetadataContext -Item $byId[$target] -Model $target
+            if ($res.Found) { $found.Add($res.Setting); continue }
+            if ($res.Error) { $rejected.Add([pscustomobject]@{ Model = $target; Reason = $res.Error }) }
+        }
+        $missing.Add($target)
+    }
+    return [pscustomobject]@{
+        Settings      = @($found.ToArray())
+        MissingModels = @($missing.ToArray())
+        Rejected      = @($rejected.ToArray())
+        ItemCount     = $list.Items.Count
+    }
+}
+
+function ConvertFrom-RelayContextResponseText {
+    param([AllowNull()][string]$Text, [Parameter(Mandatory)][string[]]$TargetModels, [Parameter(Mandatory)][string]$QueryModel)
+    $seen = New-Object 'Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
+    $targets = @($TargetModels | Where-Object { -not [string]::IsNullOrWhiteSpace($_) -and $seen.Add($_) })
+    $settings = New-Object 'Collections.Generic.List[object]'
+    $missing = New-Object 'Collections.Generic.List[string]'
+    $rejected = New-Object 'Collections.Generic.List[object]'
+    $uniformValue = $null
+    if ([string]::IsNullOrWhiteSpace($Text)) {
+        return [pscustomobject]@{ Settings = @(); UniformValue = $null; MissingModels = @($targets); Rejected = @([pscustomobject]@{ Model = '*'; Reason = '模型未返回任何文本。' }) }
+    }
+    $cleaned = $Text.Trim()
+    if ($cleaned -match '(?s)^\s*```(?:json)?\s*(.*?)\s*```\s*$') { $cleaned = $Matches[1].Trim() }
+    $parsed = $null
+    $isJson = $false
+    try {
+        # Nest top-level arrays before parsing: PS 5.1 and 7 otherwise unwrap a singleton.
+        $jsonText = $cleaned
+        if ($cleaned.StartsWith('[')) { $jsonText = '{"models":' + $cleaned + '}' }
+        $parsed = $jsonText | ConvertFrom-Json -ErrorAction Stop
+        if ($null -ne $parsed -and $parsed -isnot [string] -and $parsed -isnot [int] -and $parsed -isnot [long] -and $parsed -isnot [double] -and $parsed -isnot [decimal] -and $parsed -isnot [bool]) {
+            $isJson = $true
+        }
+    } catch {
+        $first = $cleaned.IndexOf('{'); $last = $cleaned.LastIndexOf('}')
+        if (-not $cleaned.StartsWith('[') -and $first -ge 0 -and $last -gt $first) {
+            try {
+                $parsed = $cleaned.Substring($first, $last - $first + 1) | ConvertFrom-Json -ErrorAction Stop
+                if ($null -ne $parsed) { $isJson = $true }
+            } catch { }
+        }
+    }
+    if ($isJson -and $null -ne $parsed) {
+        if ($parsed.PSObject.Properties['models'] -and $null -ne $parsed.models) {
+            if ($parsed.models -is [Array]) {
+                $byExact = New-Object 'Collections.Generic.Dictionary[string,object]' ([StringComparer]::Ordinal)
+                foreach ($row in $parsed.models) {
+                    if ($null -eq $row) { continue }
+                    $rowId = $null
+                    foreach ($idKey in @('id', 'model', 'slug')) {
+                        if ($row.PSObject.Properties[$idKey] -and $row.$idKey -is [string] -and -not [string]::IsNullOrWhiteSpace($row.$idKey)) {
+                            $rowId = $row.$idKey; break
+                        }
+                    }
+                    if ($rowId -and -not $byExact.ContainsKey($rowId)) { $byExact[$rowId] = $row }
+                }
+                foreach ($target in $targets) {
+                    $row = $null
+                    if ($byExact.ContainsKey($target)) { $row = $byExact[$target] }
+                    else {
+                        $ci = @($byExact.Keys | Where-Object { $_ -ieq $target })
+                        if ($ci.Count -eq 1) { $row = $byExact[$ci[0]] }
+                    }
+                    if ($null -eq $row) { $missing.Add($target); continue }
+                    $rawVal = $null
+                    foreach ($valKey in @('context_window', 'max_context_window', 'context_length')) {
+                        if ($row.PSObject.Properties[$valKey]) { $rawVal = $row.$valKey; break }
+                    }
+                    if ($null -eq $rawVal) { $missing.Add($target); continue }
+                    try {
+                        $settings.Add((New-RelayContextSetting -Model $target -ContextWindow $rawVal -Source 'RESPONSES_QUERY' -Evidence ('responses:' + $QueryModel)))
+                    } catch {
+                        $rejected.Add([pscustomobject]@{ Model = $target; Reason = $_.Exception.Message })
+                        $missing.Add($target)
+                    }
+                }
+                return [pscustomobject]@{ Settings = @($settings.ToArray()); UniformValue = $null; MissingModels = @($missing.ToArray()); Rejected = @($rejected.ToArray()) }
+            }
+            $mapObj = $parsed.models
+            foreach ($target in $targets) {
+                $prop = $mapObj.PSObject.Properties[$target]
+                if ($null -eq $prop) {
+                    $ciProps = @($mapObj.PSObject.Properties | Where-Object { $_.Name -ceq $target })
+                    if (-not $ciProps.Count) {
+                        $ciProps = @($mapObj.PSObject.Properties | Where-Object { $_.Name -ieq $target })
+                    }
+                    if ($ciProps.Count -eq 1) { $prop = $ciProps[0] }
+                }
+                if ($null -eq $prop -or $null -eq $prop.Value) { $missing.Add($target); continue }
+                try {
+                    $settings.Add((New-RelayContextSetting -Model $target -ContextWindow $prop.Value -Source 'RESPONSES_QUERY' -Evidence ('responses:' + $QueryModel)))
+                } catch {
+                    $rejected.Add([pscustomobject]@{ Model = $target; Reason = $_.Exception.Message })
+                    $missing.Add($target)
+                }
+            }
+            return [pscustomobject]@{ Settings = @($settings.ToArray()); UniformValue = $null; MissingModels = @($missing.ToArray()); Rejected = @($rejected.ToArray()) }
+        }
+        $directMatches = @($targets | Where-Object { $null -ne $parsed.PSObject.Properties[$_] })
+        if ($directMatches.Count) {
+            foreach ($target in $targets) {
+                $prop = $parsed.PSObject.Properties[$target]
+                if ($null -eq $prop -or $null -eq $prop.Value) { $missing.Add($target); continue }
+                try {
+                    $settings.Add((New-RelayContextSetting -Model $target -ContextWindow $prop.Value -Source 'RESPONSES_QUERY' -Evidence ('responses:' + $QueryModel)))
+                } catch {
+                    $rejected.Add([pscustomobject]@{ Model = $target; Reason = $_.Exception.Message })
+                    $missing.Add($target)
+                }
+            }
+            return [pscustomobject]@{ Settings = @($settings.ToArray()); UniformValue = $null; MissingModels = @($missing.ToArray()); Rejected = @($rejected.ToArray()) }
+        }
+        foreach ($scalarKey in @('context_window', 'max_context_window', 'context_length')) {
+            if ($parsed.PSObject.Properties[$scalarKey] -and $null -ne $parsed.$scalarKey) {
+                try {
+                    $val = ConvertTo-RelayContextWindowValue $parsed.$scalarKey
+                    if ($targets.Count -eq 1) {
+                        $settings.Add((New-RelayContextSetting -Model $targets[0] -ContextWindow $val -Source 'RESPONSES_QUERY' -Evidence ('responses:' + $QueryModel)))
+                    } else {
+                        $uniformValue = $val
+                    }
+                } catch {
+                    $rejected.Add([pscustomobject]@{ Model = '*'; Reason = $_.Exception.Message })
+                    foreach ($t in $targets) { $missing.Add($t) }
+                }
+                return [pscustomobject]@{ Settings = @($settings.ToArray()); UniformValue = $uniformValue; MissingModels = @($missing.ToArray()); Rejected = @($rejected.ToArray()) }
+            }
+        }
+        foreach ($t in $targets) { $missing.Add($t) }
+        $rejected.Add([pscustomobject]@{ Model = '*'; Reason = '返回的 JSON 未包含 models 或 context_window 字段。' })
+        return [pscustomobject]@{ Settings = @(); UniformValue = $null; MissingModels = @($missing.ToArray()); Rejected = @($rejected.ToArray()) }
+    }
+    try {
+        $val = ConvertTo-RelayContextWindowValue $cleaned
+        if ($targets.Count -eq 1) {
+            $settings.Add((New-RelayContextSetting -Model $targets[0] -ContextWindow $val -Source 'RESPONSES_QUERY' -Evidence ('responses:' + $QueryModel)))
+        } else {
+            $uniformValue = $val
+        }
+        return [pscustomobject]@{ Settings = @($settings.ToArray()); UniformValue = $uniformValue; MissingModels = @(); Rejected = @() }
+    } catch {
+        $rejected.Add([pscustomobject]@{ Model = '*'; Reason = $_.Exception.Message })
+        return [pscustomobject]@{ Settings = @(); UniformValue = $null; MissingModels = @($targets); Rejected = @($rejected.ToArray()) }
+    }
+}
+
+function Get-RelayContextFromResponses {
+    param(
+        [Parameter(Mandatory)]$Provider,
+        [Parameter(Mandatory)][string]$QueryModel,
+        [Parameter(Mandatory)][string[]]$TargetModels,
+        [ValidateRange(1, 300)][int]$TimeoutSeconds = 30
+    )
+    if ([string]::IsNullOrWhiteSpace($QueryModel) -or $QueryModel -match '[\x00-\x1f\x7f]') { throw '请求模型 ID 无效。' }
+    $seen = New-Object 'Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
+    $targets = @($TargetModels | Where-Object { -not [string]::IsNullOrWhiteSpace($_) -and $seen.Add($_) })
+    if (-not $targets.Count) { throw '请至少指定一个目标模型 ID。' }
+    foreach ($t in $targets) { if ($t -match '[\x00-\x1f\x7f]') { throw '目标模型 ID 包含控制字符。' } }
+    $quotedTargets = ($targets | ForEach-Object { ConvertTo-Json -InputObject $_ -Compress }) -join ', '
+    $prompt = @(
+        'Return ONLY a single JSON object and nothing else.'
+        'Do NOT use K, M, G, or any unit suffixes. Every number must be a raw positive integer token count (e.g. 1000000 or 272000), or null if unknown.'
+        'Format: {"models":[{"id":"<exact_model_id>","context_window":<raw_integer_or_null>}]}'
+        ('Target model IDs: ' + $quotedTargets)
+    ) -join "`n"
+    $probe = Invoke-RelayResponsesProbe -Provider $Provider -Model $QueryModel -InputText $prompt -TimeoutSeconds $TimeoutSeconds -CollectText
+    if ($probe.Status -cne 'COMPATIBLE') {
+        return [pscustomobject]@{
+            Status        = $probe.Status
+            Message       = $probe.Message
+            Settings      = @()
+            UniformValue  = $null
+            MissingModels = @($targets)
+            Rejected      = @()
+        }
+    }
+    $parsed = ConvertFrom-RelayContextResponseText -Text $probe.Text -TargetModels $targets -QueryModel $QueryModel
+    return [pscustomobject]@{
+        Status        = 'COMPATIBLE'
+        Message       = $probe.Message
+        Settings      = @($parsed.Settings)
+        UniformValue  = $parsed.UniformValue
+        MissingModels = @($parsed.MissingModels)
+        Rejected      = @($parsed.Rejected)
+    }
+}
+
+function Assert-RelayCatalogJsonDepth {
+    param([Parameter(Mandatory)]$Document, [string]$Kind = 'context')
+    # Compare serialization directly; parsing ISO date strings changes their precision in PS7.
+    $serialized = ConvertTo-Json -InputObject $Document -Depth 30
+    if ($serialized -cne (ConvertTo-Json -InputObject $Document -Depth 100)) {
+        throw ('Catalog ' + $Kind + ' metadata 超出安全 JSON 深度，拒绝有损保存。')
+    }
+}
+
+function Apply-RelayContextSettings {
+    param([Parameter(Mandatory)]$Provider, [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Settings)
+    if (-not $Settings.Count) { return }
+    Invoke-RelayStoreLock {
+        $paths = Get-RelayCatalogPaths -Provider $Provider
+        if (-not [IO.File]::Exists($paths.ModelsPath)) { throw 'Catalog 不存在；请先接入模型再设置上下文窗口。' }
+        $document = Read-RelayJson -Path $paths.ModelsPath
+        Assert-RelayCatalogDocument $document
+        $entries = New-Object 'Collections.Generic.Dictionary[string,object]' ([StringComparer]::Ordinal)
+        foreach ($entry in $document.models) { $entries.Add($entry.slug, $entry) }
+        $seen = New-Object 'Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
+        $validated = New-Object 'Collections.Generic.List[object]'
+        # Validate the whole batch before touching any entry or creating a backup.
+        foreach ($setting in $Settings) {
+            foreach ($field in @('Model', 'ContextWindow', 'MaxContextWindow', 'Source')) {
+                if (-not $setting -or -not $setting.PSObject.Properties[$field]) { throw ('Context setting 缺少字段：' + $field) }
+            }
+            if ($setting.Model -isnot [string] -or -not $entries.ContainsKey($setting.Model)) { throw ('未知 Catalog model：' + $setting.Model + '；整批拒绝写入。') }
+            if (-not $seen.Add($setting.Model)) { throw 'Context settings 含重复 model；整批拒绝写入。' }
+            if ($setting.Source -cnotin @('MANUAL', 'MODELS_METADATA', 'RESPONSES_QUERY')) { throw 'Context Source 无效。' }
+            $eff = $null
+            if ($setting.PSObject.Properties['EffectiveContextWindowPercent'] -and $null -ne $setting.EffectiveContextWindowPercent) {
+                $eff = $setting.EffectiveContextWindowPercent
+            }
+            $compact = $null
+            if ($setting.PSObject.Properties['AutoCompactTokenLimit'] -and $null -ne $setting.AutoCompactTokenLimit) {
+                $compact = $setting.AutoCompactTokenLimit
+            }
+            $evidence = ''
+            if ($setting.PSObject.Properties['Evidence'] -and $null -ne $setting.Evidence) { $evidence = [string]$setting.Evidence }
+            $validated.Add((New-RelayContextSetting -Model $setting.Model -ContextWindow $setting.ContextWindow -MaxContextWindow $setting.MaxContextWindow -EffectiveContextWindowPercent $eff -AutoCompactTokenLimit $compact -Source $setting.Source -Evidence $evidence))
+        }
+        $now = [DateTime]::UtcNow.ToString('o')
+        foreach ($item in $validated) {
+            $entry = $entries[$item.Model]
+            $entry | Add-Member NoteProperty context_window ([int64]$item.ContextWindow) -Force
+            $entry | Add-Member NoteProperty max_context_window ([int64]$item.MaxContextWindow) -Force
+            if ($null -ne $item.EffectiveContextWindowPercent) {
+                $entry | Add-Member NoteProperty effective_context_window_percent ([int]$item.EffectiveContextWindowPercent) -Force
+            }
+            $entry | Add-Member NoteProperty auto_compact_token_limit $item.AutoCompactTokenLimit -Force
+            $entry | Add-Member NoteProperty relay_context_evidence ([pscustomobject]@{ Source = $item.Source; Evidence = $item.Evidence; UpdatedAt = $now }) -Force
+        }
+        Assert-RelayCatalogDocument $document
+        Assert-RelayCatalogJsonDepth -Document $document
+        $backup = $paths.ModelsPath + '.' + [guid]::NewGuid().ToString('N') + '.bak'
+        [IO.File]::Copy($paths.ModelsPath, $backup, $false)
+        Write-RelayJson -Path $paths.ModelsPath -Value $document
     }
 }
 
@@ -1581,14 +2051,9 @@ function Show-RelayModelList {
     }
 }
 
-function Select-RelayModelsBatch {
-    param($Provider)
-    $cache = Get-RelayModelCache $Provider
-    if (-not $cache) { Update-RelayModelsUi $Provider; $cache = Get-RelayModelCache $Provider }
-    if (-not $cache -or -not @($cache.Models).Count) { Write-RelaySafe '没有模型缓存，请先刷新模型。' Yellow; return }
-    $models = @($cache.Models)
+function Select-RelayModelsFromList {
+    param([string[]]$Models)
     $selected = New-Object 'Collections.Generic.List[string]'
-    Show-RelayModelList -Provider $Provider -Models $models
     Write-RelaySafe '输入序号（可用 , 分隔多个），回车后继续输入；0 取消并退出，00 结束选择。' Cyan
     while ($true) {
         $answer = (Read-Host ('已选 {0} 个，请输入' -f $selected.Count)).Trim()
@@ -1601,15 +2066,25 @@ function Select-RelayModelsBatch {
         $valid = $true
         foreach ($part in ($answer -split '[,，]')) {
             $token = $part.Trim(); $index = 0
-            if ($token -in @('0', '00') -or $token -notmatch '^\d+$' -or -not [int]::TryParse($token, [ref]$index) -or $index -lt 1 -or $index -gt $models.Count) { $valid = $false; break }
+            if ($token -in @('0', '00') -or $token -notmatch '^\d+$' -or -not [int]::TryParse($token, [ref]$index) -or $index -lt 1 -or $index -gt $Models.Count) { $valid = $false; break }
             $indices.Add($index - 1)
         }
         if (-not $valid) { Write-RelaySafe '本行含无效序号，整行未添加。0 / 00 必须单独输入。' Yellow; continue }
         foreach ($index in $indices) {
-            if (-not ($selected.ToArray() -ccontains $models[$index])) { $selected.Add($models[$index]) }
+            if (-not ($selected.ToArray() -ccontains $Models[$index])) { $selected.Add($Models[$index]) }
         }
         Write-RelaySafe ('已选 {0} 个：{1}' -f $selected.Count, ($selected.ToArray() -join ', ')) Cyan
     }
+}
+
+function Select-RelayModelsBatch {
+    param($Provider)
+    $cache = Get-RelayModelCache $Provider
+    if (-not $cache) { Update-RelayModelsUi $Provider; $cache = Get-RelayModelCache $Provider }
+    if (-not $cache -or -not @($cache.Models).Count) { Write-RelaySafe '没有模型缓存，请先刷新模型。' Yellow; return }
+    $models = @($cache.Models)
+    Show-RelayModelList -Provider $Provider -Models $models
+    return (Select-RelayModelsFromList -Models $models)
 }
 
 function Select-RelayModel {
@@ -1818,10 +2293,7 @@ function Apply-RelayEffortSettings {
             $entry.supported_reasoning_levels = [object[]]$descriptions
         }
         Assert-RelayCatalogDocument $document
-        # Match the main catalog writer's lossless-depth check before backing up/writing.
-        $serialized = ConvertTo-Json -InputObject $document -Depth 30
-        $roundtrip = $serialized | ConvertFrom-Json
-        if ((ConvertTo-Json -InputObject $document -Depth 100 -Compress) -cne (ConvertTo-Json -InputObject $roundtrip -Depth 100 -Compress)) { throw 'Catalog effort metadata 超出安全 JSON 深度，拒绝有损保存。' }
+        Assert-RelayCatalogJsonDepth -Document $document -Kind 'effort'
         # Keep an exact pre-change backup even outside Publish; GUID format is understood by catalog cleanup.
         $backup = $paths.ModelsPath + '.' + [guid]::NewGuid().ToString('N') + '.bak'
         [IO.File]::Copy($paths.ModelsPath, $backup, $false)
@@ -1829,11 +2301,249 @@ function Apply-RelayEffortSettings {
     }
 }
 
+function Select-RelayQueryModelUi {
+    param([Parameter(Mandatory)]$Provider, [string[]]$CandidateModels = @())
+    $unique = New-Object 'Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
+    $candidates = @($CandidateModels | Where-Object { -not [string]::IsNullOrWhiteSpace($_) -and $unique.Add($_) })
+    $cache = Get-RelayModelCache $Provider
+    if ($cache) {
+        foreach ($cached in @($cache.Models)) {
+            if (-not [string]::IsNullOrWhiteSpace($cached) -and $unique.Add($cached)) { $candidates += $cached }
+        }
+    }
+    Write-RelaySafe '请选择用于发起统一上下文请求的模型（用户设置的模型）：' Cyan
+    for ($i = 0; $i -lt $candidates.Count; $i++) {
+        Write-RelaySafe ('[{0}] {1}' -f ($i + 1), $candidates[$i])
+    }
+    while ($true) {
+        $answer = ([string](Read-Host '选择请求模型序号，M 手动输入，0 跳过')).Trim()
+        if ($answer -eq '0') { return $null }
+        if ($answer -ceq 'M' -or $answer -ceq 'm') {
+            $manual = ([string](Read-Host '输入请求模型 ID（0 返回）')).Trim()
+            if ($manual -eq '0') { return $null }
+            if (-not [string]::IsNullOrWhiteSpace($manual) -and $manual -notmatch '[\x00-\x1f\x7f]') { return $manual }
+            Write-RelaySafe '模型 ID 无效。' Yellow
+            continue
+        }
+        $index = 0
+        if ([int]::TryParse($answer, [ref]$index) -and $index -ge 1 -and $index -le $candidates.Count) {
+            return $candidates[$index - 1]
+        }
+        Write-RelaySafe '输入无效，请重试。' Yellow
+    }
+}
+
+function Format-RelayEntryContextSummary {
+    param($Entry)
+    if ($null -eq $Entry) { return '未接入目录（默认按官方模板，如 gpt-5.5 为 272000）' }
+    $ctx = if ($Entry.PSObject.Properties['context_window'] -and $null -ne $Entry.context_window) { [string]$Entry.context_window } else { '未设置' }
+    $maxCtx = if ($Entry.PSObject.Properties['max_context_window'] -and $null -ne $Entry.max_context_window) { [string]$Entry.max_context_window } else { '未设置' }
+    $eff = if ($Entry.PSObject.Properties['effective_context_window_percent'] -and $null -ne $Entry.effective_context_window_percent) { [string]$Entry.effective_context_window_percent + '%' } else { '默认(95%)' }
+    $compact = if ($Entry.PSObject.Properties['auto_compact_token_limit'] -and $null -ne $Entry.auto_compact_token_limit) { [string]$Entry.auto_compact_token_limit } else { '自动(null)' }
+    return ('context_window={0}, max={1}, effective={2}, auto_compact={3}' -f $ctx, $maxCtx, $eff, $compact)
+}
+
+function Select-RelayContextSettingsUi {
+    param([Parameter(Mandatory)]$Provider, [Parameter(Mandatory)][AllowEmptyCollection()][string[]]$Models)
+    if (-not $Models.Count) { return }
+    $unique = New-Object 'Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
+    $available = @($Models | Where-Object { -not [string]::IsNullOrWhiteSpace($_) -and $unique.Add($_) })
+    if (-not $available.Count) { return }
+    while ($true) {
+        Write-RelaySafe '上下文窗口：[0] 跳过（保留已有/模板默认） [1] 手动分模型设置（原始数字，禁用 K/M） [2] 自动请求上下文窗口（统一请求）'
+        $mode = ([string](Read-Host '选择上下文窗口设置方式')).Trim()
+        if ($mode -eq '0') { return }
+        if ($mode -in @('1', '2')) { break }
+        Write-RelaySafe '请输入 0、1 或 2。' Yellow
+    }
+    $existingBySlug = New-Object 'Collections.Generic.Dictionary[string,object]' ([StringComparer]::Ordinal)
+    $paths = Get-RelayCatalogPaths -Provider $Provider
+    if ([IO.File]::Exists($paths.ModelsPath)) {
+        $document = Read-RelayJson -Path $paths.ModelsPath
+        Assert-RelayCatalogDocument $document
+        foreach ($entry in $document.models) { $existingBySlug[$entry.slug] = $entry }
+    }
+    if ($mode -eq '1') {
+        Write-RelaySafe '规则：必须输入原始正整数（如 1000000 或 272000），严禁使用 K、M 等单位；按模型分别设置。' Cyan
+        $settings = New-Object 'Collections.Generic.List[object]'
+        for ($i = 0; $i -lt $available.Count; $i++) {
+            $model = $available[$i]
+            $existing = $null
+            if ($existingBySlug.ContainsKey($model)) { $existing = $existingBySlug[$model] }
+            Write-RelaySafe ('[{0}/{1}] {2}  当前：{3}' -f ($i + 1), $available.Count, $model, (Format-RelayEntryContextSummary $existing)) Cyan
+            $ctxVal = $null
+            while ($true) {
+                $raw = ([string](Read-Host ('[' + ($i + 1) + '/' + $available.Count + '] ' + $model + ' 的 context_window（原始数字；回车跳过此模型，0 取消全部）'))).Trim()
+                if ($raw -ceq '0') { Write-RelaySafe '已取消本次上下文窗口设置。' Yellow; return }
+                if ($raw -eq '') { break }
+                try { $ctxVal = ConvertTo-RelayContextWindowValue $raw; break }
+                catch { Write-RelaySafe $_.Exception.Message Red }
+            }
+            if ($null -eq $ctxVal) { continue }
+            $defaultEff = 95
+            if ($null -ne $existing -and $existing.PSObject.Properties['effective_context_window_percent'] -and $null -ne $existing.effective_context_window_percent) {
+                $defaultEff = [int]$existing.effective_context_window_percent
+            }
+            $effVal = $defaultEff
+            while ($true) {
+                $rawEff = ([string](Read-Host ('effective_context_window_percent [1-100，回车默认 ' + $defaultEff + ']'))).Trim()
+                if ($rawEff -eq '') { break }
+                try { $effVal = ConvertTo-RelayEffectivePercentValue $rawEff; break }
+                catch { Write-RelaySafe $_.Exception.Message Red }
+            }
+            $existingCompact = $null
+            if ($null -ne $existing -and $existing.PSObject.Properties['auto_compact_token_limit'] -and $null -ne $existing.auto_compact_token_limit) {
+                $existingCompact = [int64]$existing.auto_compact_token_limit
+            }
+            $compactHint = '自动(null)'
+            if ($null -ne $existingCompact -and $existingCompact -le $ctxVal) { $compactHint = '保留当前 ' + $existingCompact }
+            $compactVal = $null
+            while ($true) {
+                $rawCompact = ([string](Read-Host ('auto_compact_token_limit [原始数字<=' + $ctxVal + '，回车 ' + $compactHint + '，CLEAR 清空]'))).Trim()
+                if ($rawCompact -eq '') {
+                    if ($null -ne $existingCompact -and $existingCompact -le $ctxVal) { $compactVal = $existingCompact }
+                    break
+                }
+                if ($rawCompact -ieq 'CLEAR' -or $rawCompact -ieq 'NULL') { $compactVal = $null; break }
+                try {
+                    $parsedCompact = ConvertTo-RelayRawPositiveInt64 $rawCompact -Label 'auto_compact_token_limit'
+                    if ($parsedCompact -gt $ctxVal) { Write-RelaySafe ('auto_compact_token_limit 不能大于 context_window (' + $ctxVal + ')。') Red; continue }
+                    $compactVal = $parsedCompact; break
+                } catch { Write-RelaySafe $_.Exception.Message Red }
+            }
+            $settings.Add((New-RelayContextSetting -Model $model -ContextWindow $ctxVal -MaxContextWindow $ctxVal -EffectiveContextWindowPercent $effVal -AutoCompactTokenLimit $compactVal -Source 'MANUAL' -Evidence 'manual-per-model'))
+        }
+        return $settings.ToArray()
+    }
+    $proposed = New-Object Collections.Specialized.OrderedDictionary ([StringComparer]::Ordinal)
+    $missing = @($available)
+    Write-RelaySafe ('正在向 ' + $Provider.BaseUrl + '/models 发送统一元数据请求（不触发对话计费）...') Cyan
+    try {
+        $meta = Get-RelayContextFromModels -Provider $Provider -Models $available
+        foreach ($item in $meta.Settings) {
+            $proposed[$item.Model] = $item
+            Write-RelaySafe ('  [元数据] {0} -> {1} ({2})' -f $item.Model, $item.ContextWindow, $item.Evidence) Green
+        }
+        foreach ($rej in $meta.Rejected) {
+            Write-RelaySafe ('  [元数据已拒绝] {0}: {1}' -f $rej.Model, $rej.Reason) Yellow
+        }
+        $missing = @($meta.MissingModels)
+    } catch {
+        Write-RelaySafe ('/models 元数据请求失败：' + $_.Exception.Message) Yellow
+    }
+    if ($missing.Count -gt 0) {
+        Write-RelaySafe ('以下 {0} 个模型未从 /models 获取到有效上下文窗口：{1}' -f $missing.Count, ($missing -join ', ')) Yellow
+        if (Confirm-RelayAction ('是否使用用户选定的模型向 ' + $Provider.BaseUrl + '/responses 发起一次统一请求（可能产生费用，且结果仅供参考）')) {
+            $queryModel = Select-RelayQueryModelUi -Provider $Provider -CandidateModels $available
+            if ($queryModel) {
+                $resp = Get-RelayContextFromResponses -Provider $Provider -QueryModel $queryModel -TargetModels $missing
+                if ($resp.Status -cne 'COMPATIBLE') {
+                    Write-RelaySafe ($resp.Status + '：' + $resp.Message) (Get-RelayStatusColor $resp.Status)
+                } else {
+                    foreach ($item in $resp.Settings) {
+                        $proposed[$item.Model] = $item
+                        Write-RelaySafe ('  [模型请求] {0} -> {1} ({2})' -f $item.Model, $item.ContextWindow, $item.Evidence) Green
+                    }
+                    if ($null -ne $resp.UniformValue -and $missing.Count -gt 1) {
+                        if (Confirm-RelayAction ('模型返回单一原始数值 ' + $resp.UniformValue + '；是否统一应用到以上 ' + $missing.Count + ' 个待配置模型')) {
+                            foreach ($m in $missing) {
+                                if (-not $proposed.Contains($m)) {
+                                    $proposed[$m] = New-RelayContextSetting -Model $m -ContextWindow $resp.UniformValue -Source 'RESPONSES_QUERY' -Evidence ('responses-uniform:' + $queryModel)
+                                }
+                            }
+                        }
+                    }
+                    foreach ($rej in $resp.Rejected) {
+                        Write-RelaySafe ('  [响应解析拒绝] {0}: {1}' -f $rej.Model, $rej.Reason) Red
+                    }
+                }
+            }
+        }
+    }
+    if ($proposed.Count -eq 0) {
+        Write-RelaySafe '未能获取到有效的上下文窗口数值，保留已有/模板默认。' Yellow
+        return
+    }
+    Write-RelaySafe '拟应用的上下文窗口设置：' Cyan
+    $resultList = New-Object 'Collections.Generic.List[object]'
+    foreach ($entry in $proposed.Values) {
+        $resultList.Add($entry)
+        Write-RelaySafe ('  {0} -> context_window={1}, max_context_window={2}, effective={3}% ({4})' -f $entry.Model, $entry.ContextWindow, $entry.MaxContextWindow, $entry.EffectiveContextWindowPercent, $entry.Source)
+    }
+    Write-RelaySafe '注意：自动获取或模型自述的数值不代表上游网关已验证支持；写入后请在新会话验证实际限制。' Yellow
+    if (-not (Confirm-RelayAction ('确认采用以上 ' + $resultList.Count + ' 个模型的上下文窗口设置'))) { return }
+    return $resultList.ToArray()
+}
+
+function Update-RelayContextSettingsUi {
+    param($Provider = $null, [string]$ConfigPath)
+    if ($null -eq $Provider) {
+        $Provider = Select-RelayProvider
+        if ($null -eq $Provider) { return }
+    }
+    $paths = Get-RelayCatalogPaths -Provider $Provider
+    if (-not [IO.File]::Exists($paths.ModelsPath)) {
+        Write-RelaySafe ($Provider.Name + '：尚无已接入的模型目录，请先运行菜单 [9] 接入模型。') Yellow
+        return
+    }
+    $ConfigPath = Get-RelaySharedConfigPath $ConfigPath
+    $configSnapshot = Get-RelaySharedSnapshot $ConfigPath
+    Assert-RelayContextConfigOverrides -Text (ConvertFrom-RelaySharedBytes $configSnapshot.Bytes)
+    $document = Read-RelayJson -Path $paths.ModelsPath
+    Assert-RelayCatalogDocument $document
+    if (-not $document.models.Count) {
+        Write-RelaySafe ($Provider.Name + '：模型目录为空。') Yellow
+        return
+    }
+    $catalogModels = @($document.models | ForEach-Object { $_.slug })
+    Write-RelaySafe ("`n" + $Provider.Name + ' 当前模型目录上下文窗口：') Cyan
+    for ($i = 0; $i -lt $document.models.Count; $i++) {
+        Write-RelaySafe ('[{0}] {1}  ({2})' -f ($i + 1), $document.models[$i].slug, (Format-RelayEntryContextSummary $document.models[$i]))
+    }
+    Write-Host '[1] 调整全部已接入模型 [2] 选择单个模型 [3] 批量选择已有目录模型 [0] 返回'
+    $choice = ([string](Read-Host '选择')).Trim()
+    $targetModels = @()
+    if ($choice -eq '1') {
+        $targetModels = $catalogModels
+    } elseif ($choice -eq '2') {
+        while ($true) {
+            $answer = ([string](Read-Host '模型序号（0 返回）')).Trim(); $index = 0
+            if ($answer -eq '0') { return }
+            if ([int]::TryParse($answer, [ref]$index) -and $index -ge 1 -and $index -le $catalogModels.Count) {
+                $targetModels = @($catalogModels[$index - 1]); break
+            }
+            Write-RelaySafe '请输入有效序号。' Yellow
+        }
+    } elseif ($choice -eq '3') {
+        $targetModels = @(Select-RelayModelsFromList -Models $catalogModels)
+    } else { return }
+    if (-not $targetModels.Count) { return }
+    $settings = @(Select-RelayContextSettingsUi -Provider $Provider -Models $targetModels)
+    if (-not $settings.Count) { return }
+    Write-RelaySafe ('目标模型目录：' + $paths.ModelsPath)
+    foreach ($item in $settings) {
+        $compactDesc = if ($null -ne $item.AutoCompactTokenLimit) { [string]$item.AutoCompactTokenLimit } else { '自动(null)' }
+        Write-RelaySafe ('  {0}：context_window={1}, max_context_window={2}, effective={3}%, auto_compact={4}' -f $item.Model, $item.ContextWindow, $item.MaxContextWindow, $item.EffectiveContextWindowPercent, $compactDesc) Cyan
+    }
+    if (-not (Confirm-RelayAction ('将先备份 models.json 并应用以上 ' + $settings.Count + ' 个模型的上下文窗口设置（不修改共享 config.toml），继续'))) { return }
+    Invoke-RelayStoreLock {
+        $configSnapshot = Get-RelaySharedSnapshot $ConfigPath
+        Assert-RelayContextConfigOverrides -Text (ConvertFrom-RelaySharedBytes $configSnapshot.Bytes)
+        Apply-RelayContextSettings -Provider $Provider -Settings $settings
+    }
+    Write-RelaySafe ('已备份并更新 ' + $settings.Count + ' 个模型的上下文窗口。请完全退出并重新打开 App，再新建会话以加载新容量。') Green
+}
+
 function Publish-RelayCodexModels {
-    param([Parameter(Mandatory)]$Provider, [Parameter(Mandatory)][string[]]$Models, [Parameter(Mandatory)]$Plan, [object[]]$EffortSettings = @())
+    param([Parameter(Mandatory)]$Provider, [Parameter(Mandatory)][string[]]$Models, [Parameter(Mandatory)]$Plan, [object[]]$EffortSettings = @(), [object[]]$ContextSettings = @())
     if ($Plan.ProviderId -cne $Provider.Id -or $Models -cnotcontains $Plan.Model) { throw '共享配置预览与所选 Provider/默认模型不一致。' }
     $paths = Get-RelayCatalogPaths $Provider
     Invoke-RelayStoreLock {
+        if ($ContextSettings.Count) {
+            $configSnapshot = Get-RelaySharedSnapshot $Plan.ConfigPath
+            Assert-RelayContextConfigOverrides -Text (ConvertFrom-RelaySharedBytes $configSnapshot.Bytes)
+            Assert-RelayContextConfigOverrides -Text $Plan.Content
+        }
         $before = @{}
         foreach ($path in @($paths.ModelsPath, $paths.ConfigPath)) {
             $before[$path] = $null
@@ -1843,6 +2553,7 @@ function Publish-RelayCodexModels {
             Add-RelayCodexModels -Provider $Provider -Models $Models | Out-Null
             Update-RelayCatalogOfficialTemplates -Provider $Provider -Models $Models | Out-Null
             if ($EffortSettings.Count) { Apply-RelayEffortSettings -Provider $Provider -Settings $EffortSettings }
+            if ($ContextSettings.Count) { Apply-RelayContextSettings -Provider $Provider -Settings $ContextSettings }
             Install-RelayCredentialHelper -Provider $Provider | Out-Null
             $transaction = Invoke-RelaySharedConfigPlan -Plan $Plan
             return $transaction
@@ -1885,7 +2596,7 @@ function Select-RelayDefaultModel {
 function Add-RelayCodexModelsUi {
     param($Provider)
     Write-RelaySafe '将模型合并到受管目录，并安全更新 CLI/App 共用 config.toml；保留无关 Provider、MCP、Profile 和指令。' Cyan
-    Write-RelaySafe '接入保存本身不发送模型请求；如选择 effort API 检测，会额外调用模型并产生费用。' Yellow
+    Write-RelaySafe '接入保存本身不发送模型请求；如选择 effort API 检测或自动请求上下文窗口，会额外发起网络请求。' Yellow
     Write-RelaySafe '模型目录使用 OpenAI 官方模板（非匹配模型借用 gpt-5.5）；保留正常工具与图片声明，但不代表网关能力已验证。' Yellow
     Write-Host '[1] 选择单个模型 [2] 批量选择模型 [3] 加入全部缓存模型 [0] 返回'
     $choice = Read-Host '选择'
@@ -1901,19 +2612,26 @@ function Add-RelayCodexModelsUi {
     } else { return }
     if (-not $models.Count) { return }
     $effortSettings = @(Select-RelayEffortSettingsUi -Provider $Provider -Models $models)
+    $contextSettings = @(Select-RelayContextSettingsUi -Provider $Provider -Models $models)
     $defaultModel = Select-RelayDefaultModel -Models $models
     if (-not $defaultModel) { return }
     $paths = Get-RelayCatalogPaths $Provider
     $auth = Get-RelayCredentialConfig -Provider $Provider
-    $plan = New-RelaySharedConfigPlan -Provider $Provider -Model $defaultModel -CatalogPath $paths.ModelsPath -AuthConfig $auth -EffortSettings $effortSettings
+    $plan = New-RelaySharedConfigPlan -Provider $Provider -Model $defaultModel -CatalogPath $paths.ModelsPath -AuthConfig $auth -EffortSettings $effortSettings -ContextSettings $contextSettings
     Write-RelaySafe ('共用配置文件：' + $plan.ConfigPath)
     Write-RelaySafe ('模型目录文件：' + $paths.ModelsPath)
     Write-RelaySafe ('默认 Provider / 模型：' + $Provider.Name + ' / ' + $defaultModel)
+    if ($contextSettings.Count) {
+        Write-RelaySafe ('上下文窗口将独立写入 {0} 个模型：' -f $contextSettings.Count) Cyan
+        foreach ($ctx in $contextSettings) {
+            Write-RelaySafe ('  {0}: context_window={1}, max={2}, effective={3}%' -f $ctx.Model, $ctx.ContextWindow, $ctx.MaxContextWindow, $ctx.EffectiveContextWindowPercent)
+        }
+    }
     Write-RelaySafe ('备份与事务记录：' + (Join-Path $script:RelayDataDirectory 'shared-config'))
     Write-RelaySafe '认证：当前用户 DPAPI 凭据助手；不保存明文密钥，不修改持久环境变量。' Cyan
     Write-RelaySafe '全局当前 Provider 只有一个；其他已注册 Provider 会保留。若已有覆盖设置冲突，将拒绝激活而不删除。' Yellow
     if (-not (Confirm-RelayAction ('将接入 ' + $models.Count + ' 个模型并更新以上共享配置（先备份），继续'))) { return }
-    $transaction = Publish-RelayCodexModels -Provider $Provider -Models $models -Plan $plan -EffortSettings $effortSettings
+    $transaction = Publish-RelayCodexModels -Provider $Provider -Models $models -Plan $plan -EffortSettings $effortSettings -ContextSettings $contextSettings
     Write-RelaySafe ('配置已写入，接入模型 {0} 个；默认 {1}。' -f $models.Count, $defaultModel) Green
     Write-RelaySafe '凭据助手已部署；此操作未验证真实网关或 App 的实际调用。请完全退出并重新打开 App，再新建会话。' Yellow
     Write-RelaySafe '若需撤销，请在主菜单 [10] 查看接入记录并恢复；不会强制关闭 App 或终止现有会话。' Cyan
@@ -1953,6 +2671,15 @@ function Show-RelayStatus {
     foreach ($p in @(Get-RelayProviders)) {
         Write-RelaySafe ("`n" + $p.Name + ' — ' + $p.BaseUrl)
         foreach ($record in @(Get-RelayCompatibility $p)) { Write-RelaySafe ('  {0} [{1}] {2} — {3}' -f $record.Model, $record.Status, $record.TestedAt, $record.Message) (Get-RelayStatusColor $record.Status) }
+        $catalogPaths = Get-RelayCatalogPaths $p
+        if ([IO.File]::Exists($catalogPaths.ModelsPath)) {
+            try {
+                $catDoc = Read-RelayJson -Path $catalogPaths.ModelsPath
+                foreach ($entry in @($catDoc.models)) {
+                    Write-RelaySafe ('  [目录] {0} — {1}' -f $entry.slug, (Format-RelayEntryContextSummary $entry)) DarkCyan
+                }
+            } catch { Write-RelaySafe ('  [目录读取失败] ' + $_.Exception.Message) Yellow }
+        }
     }
 }
 
@@ -1960,7 +2687,7 @@ function Update-RelayOfficialTemplatesUi {
     Write-RelaySafe '将已有 Provider 模型目录升级为 OpenAI Codex 0.167.1 官方模板，先逐目录备份。' Cyan
     Write-RelaySafe '精确模型 ID 使用对应官方条目；其他模型使用 gpt-5.5 模板，模型 ID 不改名。' Yellow
     Write-RelaySafe '恢复正常 Shell、图片输入、完整代理指令和官方工具声明；仍沿用原审批/沙箱，不代表网关能力已通过验证。' Yellow
-    Write-RelaySafe '保留已有 effort 设置和额外自定义字段；不修改共享 config.toml 或登录凭据。' Yellow
+    Write-RelaySafe '保留已有 effort、上下文窗口设置和额外自定义字段；不修改共享 config.toml 或登录凭据。' Yellow
     Write-Host '[1] 升级一个 Provider [2] 升级所有 Provider [0] 返回'
     $choice = Read-Host '选择'
     if ($choice -eq '1') { $provider = Select-RelayProvider; if (-not $provider) { return }; $providers = @($provider) }
@@ -2018,6 +2745,7 @@ function Start-RelayManager {
         Write-Host '[9] 接入 CLI/App 共用配置（支持批量选择）'
         Write-Host '[10] 共享配置接入记录与恢复'
         Write-Host '[11] 升级已有模型为 OpenAI 官方配置'
+        Write-Host '[12] 管理已有模型上下文窗口'
         Write-Host '[0] 退出'
         try {
             $choice = Read-Host '选择'
@@ -2026,10 +2754,10 @@ function Start-RelayManager {
             if ($choice -eq '8') { Show-RelayStatus; continue }
             if ($choice -eq '10') { Show-RelaySharedConfigUi; continue }
             if ($choice -eq '11') { Update-RelayOfficialTemplatesUi; continue }
-            if ($choice -notin @('2', '3', '4', '5', '6', '7', '9')) { Write-RelaySafe '请输入 0–11。' Yellow; continue }
+            if ($choice -notin @('2', '3', '4', '5', '6', '7', '9', '12')) { Write-RelaySafe '请输入 0–12。' Yellow; continue }
             $provider = Select-RelayProvider; if (-not $provider) { continue }
             if ($choice -eq '2') {
-                Write-Host '[1] 查看模型 [2] 刷新模型 [3] 检测兼容性 [4] 编辑 [5] 兼容性记录 [6] 启动 Codex [7] 加入 Codex 模型目录 [0] 返回'
+                Write-Host '[1] 查看模型 [2] 刷新模型 [3] 检测兼容性 [4] 编辑 [5] 兼容性记录 [6] 启动 Codex [7] 加入 Codex 模型目录 [8] 管理上下文窗口 [0] 返回'
                 switch (Read-Host '选择操作') {
                     '1' { [void](Select-RelayModel $provider) }
                     '2' { Update-RelayModelsUi $provider }
@@ -2038,6 +2766,7 @@ function Start-RelayManager {
                     '5' { foreach ($r in @(Get-RelayCompatibility $provider)) { Write-RelaySafe ('{0} [{1}] {2} — {3}' -f $r.Model, $r.Status, $r.TestedAt, $r.Message) (Get-RelayStatusColor $r.Status) } }
                     '6' { Start-RelayCodexUi $provider }
                     '7' { Add-RelayCodexModelsUi $provider }
+                    '8' { Update-RelayContextSettingsUi $provider }
                 }
             }
             elseif ($choice -eq '3') { Update-RelayModelsUi $provider }
@@ -2045,6 +2774,7 @@ function Start-RelayManager {
             elseif ($choice -eq '5') { Start-RelayCodexUi $provider }
             elseif ($choice -eq '6') { Edit-RelayProviderUi $provider }
             elseif ($choice -eq '9') { Add-RelayCodexModelsUi $provider }
+            elseif ($choice -eq '12') { Update-RelayContextSettingsUi $provider }
             elseif ($choice -eq '7') {
                 if (Confirm-RelayAction ('永久删除中转站 ' + $provider.Name + ' 及其加密密钥、所有缓存和受管模型目录')) {
                     Remove-RelayProvider $provider
