@@ -17,16 +17,25 @@
 
 隔离安装位于工作区 `.tools/codex`，没有修改全局 npm 安装。已获取并检查 `codex --version`、`codex --help`、`codex exec --help`。
 
+## 2026-11-12 凭据助手诊断与沙箱组修复
+
+- 保留 DPAPI，未改为明文。助手 v2 失败输出 `stage`、白名单安全原因、最深异常类型和8位 HRESULT；不输出原始异常/堆栈、Key、密文或JSON。成功 stdout 仍只包含token。
+- 实机复现 `ROOT_ACL` 原因：默认数据目录存在本机 `CodexSandboxUsers` 读取/执行授权。旧助手把它当额外账户拒绝。
+- 现在按本机账户解析SID，只允许该组的 ReadAndExecute/Synchronize；该组写入/Modify/FullControl及其他额外账户仍拒绝，DPAPI、路径/重解析点与拥有者检查保留。
+- `Test-SandboxCredentialAcl.ps1` 新增3项：正常沙箱读取取钥；沙箱写权限拒绝；其他账户拒绝；独立项目目录ACL/沙箱Modify保持不变及文件读写（部分断言合并在同一case）。测试未冒充实际沙箱进程执行项目代码，因此不能据此声称App完整代理任务通过。
+- 已升级实际Provider BI4KJD的受管助手，保留旧版本源码备份；最后复测助手源码与当前一致、退出0、token输出存在、stderr为空。未打印密钥、未向中转站请求、共享config.toml前后SHA256不变。
+- 实际App GUI是否已恢复需要重开App新会话确认；本次没有关闭App或终止会话。此前被用户中断的PS7回归不记作通过，最终四轮串行重新执行均154/154。
+
 ## 自动化结果
 
-当前 151 个独立测试 case（上一版138项＋官方目录精确/模板回归3项＋已有目录升级10项），每个 case 还包含多组断言/夹具。以下每轮都包含当前引擎和 Windows PowerShell 5.1 的 AST 解析校验，以及用户 Codex config.toml 的哈希/修改时间不变校验。
+当前 154 个独立测试 case（官方模板版151项＋沙箱凭据ACL及项目写入隔离3项），每个 case 还包含多组断言/夹具。以下每轮都包含当前引擎和 Windows PowerShell 5.1 的 AST 解析校验，以及用户 Codex config.toml 的哈希/修改时间不变校验。
 
 | 执行方式 | 引擎 | 通过 | 失败 | 证据 |
 |---|---|---:|---:|---|
-| 独立 runner | Windows PowerShell 5.1 | 151 | 0 | `tests/results/powershell51.json`、同名 `.log` |
-| 独立 runner | PowerShell 7 | 151 | 0 | `tests/results/powershell7.json`、同名 `.log` |
-| Pester 3.4.0 | Windows PowerShell 5.1 | 151 | 0 | `tests/results/pester51.json`、同名 `.log` |
-| Pester 3.4.0 | PowerShell 7 | 151 | 0 | `tests/results/pester7.json`、同名 `.log` |
+| 独立 runner | Windows PowerShell 5.1 | 154 | 0 | `tests/results/powershell51.json`、同名 `.log` |
+| 独立 runner | PowerShell 7 | 154 | 0 | `tests/results/powershell7.json`、同名 `.log` |
+| Pester 3.4.0 | Windows PowerShell 5.1 | 154 | 0 | `tests/results/pester51.json`、同名 `.log` |
+| Pester 3.4.0 | PowerShell 7 | 154 | 0 | `tests/results/pester7.json`、同名 `.log` |
 
 新增 `Test-Interaction.ps1` 验证真实选择器与确认逻辑（仅网络/文件提交使用内存替身）：状态颜色、逗号/中文逗号输入、逐行回车、顺序去重、无效整行拒绝、0 取消、00 完成及空选择、批量测试两次确认和批量目录接入确认。
 

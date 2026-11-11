@@ -37,6 +37,12 @@ function Initialize-RelayStore {
             $rule = New-Object Security.AccessControl.FileSystemAccessRule($identity, 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow')
             [void]$acl.AddAccessRule($rule)
         }
+        $sandboxSid = Get-RelayCodexSandboxSid
+        if ($sandboxSid) {
+            $sandboxIdentity = New-Object Security.Principal.SecurityIdentifier($sandboxSid)
+            $sandboxRule = New-Object Security.AccessControl.FileSystemAccessRule($sandboxIdentity, 'ReadAndExecute', 'ContainerInherit,ObjectInherit', 'None', 'Allow')
+            [void]$acl.AddAccessRule($sandboxRule)
+        }
         # Only the DACL is modified; Set-Acl may also attempt a privileged SACL write.
         if ($PSVersionTable.PSEdition -eq 'Desktop') {
             [IO.Directory]::SetAccessControl($directory, $acl)
@@ -225,6 +231,12 @@ function Assert-RelayCredentialPath {
         $current = $parent
     }
 }
+function Get-RelayCodexSandboxSid {
+    try {
+        $account = New-Object Security.Principal.NTAccount([Environment]::MachineName, 'CodexSandboxUsers')
+        return $account.Translate([Security.Principal.SecurityIdentifier]).Value
+    } catch [Security.Principal.IdentityNotMappedException] { return $null }
+}
 function Assert-RelayCredentialAcl {
     param([string]$Path, [switch]$Root)
     Assert-RelayCredentialPath $Path
@@ -241,12 +253,18 @@ function Assert-RelayCredentialAcl {
     if (-not $Root -and $acl.AreAccessRulesProtected) { throw 'Credential paths must inherit the protected root ACL.' }
     $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
     $trusted = @($sid, 'S-1-5-18')
+    $sandboxSid = Get-RelayCodexSandboxSid
+    $sandboxReadMask = [long]([Security.AccessControl.FileSystemRights]::ReadAndExecute -bor [Security.AccessControl.FileSystemRights]::Synchronize)
     $owner = $acl.GetOwner([Security.Principal.SecurityIdentifier]).Value
     if ($owner -notin @($sid, 'S-1-5-18', 'S-1-5-32-544')) { throw 'Untrusted credential path owner.' }
     $userFull = $false
     foreach ($rule in $acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier])) {
         if ($rule.AccessControlType -eq [Security.AccessControl.AccessControlType]::Allow) {
-            if ($rule.IdentityReference.Value -notin $trusted) { throw 'Credential path ACL grants access to another identity.' }
+            if ($rule.IdentityReference.Value -notin $trusted) {
+                if ($sandboxSid -and $rule.IdentityReference.Value -eq $sandboxSid) {
+                    if (([long]$rule.FileSystemRights -band (-bnot $sandboxReadMask)) -ne 0) { throw 'CodexSandboxUsers may only have read and execute access, not write or administrative permissions.' }
+                } else { throw 'Credential path ACL grants access to another identity.' }
+            }
             if ($rule.IdentityReference.Value -eq $sid -and ($rule.FileSystemRights -band [Security.AccessControl.FileSystemRights]::FullControl) -eq [Security.AccessControl.FileSystemRights]::FullControl -and -not ($rule.PropagationFlags -band [Security.AccessControl.PropagationFlags]::InheritOnly)) { $userFull = $true }
         }
     }
@@ -288,7 +306,7 @@ function Read-RelayCredentialProvider {
 function Get-RelayCredentialHelperSource {
     $entry = @'
 #requires -Version 5.1
-# Managed Codex Relay credential helper v1. No project dependencies.
+# Managed Codex Relay credential helper v2. Safe stage diagnostics; no project dependencies.
 param($DataDirectory, $ProviderId)
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
@@ -299,28 +317,69 @@ $DebugPreference = 'SilentlyContinue'
 '@
     $body = @'
 $plain = $null
+$stage = 'WINDOWS_CHECK'
 try {
     Assert-RelayCredentialWindows
+    $stage = 'DATA_PATH'
     $root = Resolve-RelayCredentialRoot $DataDirectory
+    $stage = 'ROOT_ACL'
     Assert-RelayCredentialAcl $root -Root
     $ownPath = [IO.Path]::Combine($root, 'credentials', 'credential-helper.ps1')
+    $stage = 'HELPER_DIRECTORY_ACL'
     Assert-RelayCredentialAcl ([IO.Path]::GetDirectoryName($ownPath))
+    $stage = 'HELPER_FILE_ACL'
     Assert-RelayCredentialAcl $ownPath
+    $stage = 'HELPER_LOCATION'
     if (-not [string]::Equals([IO.Path]::GetFullPath($PSCommandPath), $ownPath, [StringComparison]::OrdinalIgnoreCase)) { throw 'Invalid helper location.' }
+    $stage = 'PROVIDER_RECORD'
     $provider = Read-RelayCredentialProvider $root $ProviderId
+    $stage = 'DPAPI_ASSEMBLY'
     Add-Type -AssemblyName System.Security -ErrorAction Stop
+    $stage = 'DPAPI_DECRYPT'
     $plain = [Security.Cryptography.ProtectedData]::Unprotect([Convert]::FromBase64String($provider.EncryptedApiKey), $null, [Security.Cryptography.DataProtectionScope]::CurrentUser)
+    $stage = 'TOKEN_VALIDATION'
     if ($plain.Length -eq 0 -or $plain.Length -gt 16384) { throw 'Invalid credential length.' }
     $token = (New-Object Text.UTF8Encoding($false, $true)).GetString($plain)
     if ([string]::IsNullOrWhiteSpace($token) -or $token -match '[\p{Cc}\p{Cf}]' -or $token -cne $token.Trim()) { throw 'Invalid credential token.' }
     # Write the original UTF-8 bytes, without a BOM, newline, JSON or pipeline formatting.
+    $stage = 'TOKEN_OUTPUT'
     $output = [Console]::OpenStandardOutput()
     $output.Write($plain, 0, $plain.Length)
     $output.Flush()
     exit 0
 } catch {
-    # Never stringify exceptions, input, paths or ciphertext on either stream.
-    [Console]::Error.WriteLine('Relay credential helper failed.')
+    # Only whitelisted messages are safe; JSON, input values and exception stacks may contain secrets.
+    $safeMessages = @(
+        'Credential helper requires Windows.', 'Invalid credential data path.', 'Invalid credential data root.',
+        'Credential store must already exist.', 'Credential paths cannot contain reparse points.',
+        'Credential root must have a protected ACL.', 'Credential paths must inherit the protected root ACL.',
+        'Untrusted credential path owner.', 'Credential path ACL grants access to another identity.',
+        'Credential path must grant current user full control.', 'CodexSandboxUsers may only have read and execute access, not write or administrative permissions.', 'Invalid credential Provider ID.',
+        'Invalid credential store size.', 'Credential store must be an array.', 'Invalid credential provider record.',
+        'Duplicate credential Provider ID.', 'Invalid credential ciphertext.', 'Credential provider not found.',
+        'Invalid helper location.', 'Invalid credential length.', 'Invalid credential token.'
+    )
+    $exception = $_.Exception
+    $reason = $null
+    $leaf = $exception
+    while ($null -ne $leaf) {
+        if ($safeMessages -ccontains $leaf.Message) { $reason = $leaf.Message }
+        $exception = $leaf
+        $leaf = $leaf.InnerException
+    }
+    if (-not $reason) {
+        if ($exception -is [UnauthorizedAccessException] -or $exception -is [Security.SecurityException]) { $reason = 'Access denied by Windows security or file permissions.' }
+        elseif ($exception -is [IO.FileNotFoundException] -or $exception -is [IO.DirectoryNotFoundException]) { $reason = 'Required credential file or directory was not found.' }
+        elseif ($stage -eq 'DPAPI_DECRYPT') { $reason = 'DPAPI decryption failed; verify the Windows user/profile and re-enter the API key if needed.' }
+        elseif ($stage -eq 'PROVIDER_RECORD') { $reason = 'Credential store could not be read or parsed; verify JSON format, encrypted data and file access.' }
+        elseif ($stage -eq 'TOKEN_VALIDATION') { $reason = 'Decrypted token is not valid UTF-8 or contains unsupported characters.' }
+        elseif ($exception -is [IO.IOException]) { $reason = 'Windows file or stream operation failed; the file may be locked or unavailable.' }
+        elseif ($stage -eq 'DPAPI_ASSEMBLY') { $reason = 'Windows DPAPI assembly could not be loaded.' }
+        else { $reason = 'Unexpected failure at the reported stage; use the exception type and HRESULT for diagnosis.' }
+    }
+    $type = $exception.GetType().FullName
+    $hresult = $exception.HResult.ToString('X8')
+    [Console]::Error.WriteLine(('Relay credential helper failed. stage={0}; reason={1}; exception={2}; hresult=0x{3}' -f $stage, $reason, $type, $hresult))
     exit 1
 } finally {
     if ($null -ne $plain) { [Array]::Clear($plain, 0, $plain.Length) }
@@ -367,7 +426,19 @@ function Install-RelayCredentialHelper {
         Assert-RelayCredentialAcl $helper
         $expected = (New-Object Text.UTF8Encoding($false)).GetBytes((Get-RelayCredentialHelperSource))
         $actual = [IO.File]::ReadAllBytes($helper)
-        if ([Convert]::ToBase64String($actual) -cne [Convert]::ToBase64String($expected)) { throw 'Managed credential helper was modified; refusing to use or overwrite it.' }
+        if ([Convert]::ToBase64String($actual) -cne [Convert]::ToBase64String($expected)) {
+            $sha = [Security.Cryptography.SHA256]::Create()
+            try { $hash = [BitConverter]::ToString($sha.ComputeHash($actual)).Replace('-', '').ToLowerInvariant() }
+            finally { $sha.Dispose() }
+            if ($hash -cnotin @('171a090a8cfffce64232f404c99e3bb85e0b7fcdc2a81224c8ab8ef78b3043be', '796035502bae9e5e608d0328c576ce8c447452f35ebc8ffc352da0323dafc991')) { throw 'Managed credential helper was modified; refusing to use or overwrite it.' }
+            $temporary = $helper + '.' + [guid]::NewGuid().ToString('N') + '.tmp'
+            $backup = $helper + '.' + [guid]::NewGuid().ToString('N') + '.v1.bak'
+            try {
+                [IO.File]::WriteAllBytes($temporary, $expected)
+                Assert-RelayCredentialAcl $temporary
+                [IO.File]::Replace($temporary, $helper, $backup)
+            } finally { if ([IO.File]::Exists($temporary)) { [IO.File]::Delete($temporary) } }
+        }
         return Get-RelayCredentialConfig $Provider
     }
     if ([IO.Directory]::Exists($helper)) { throw 'Credential helper path is not a file.' }

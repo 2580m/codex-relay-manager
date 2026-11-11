@@ -1,6 +1,0 @@
-PASS AST parsing (current engine + Windows PowerShell 5.1)
-PASS [EffortTransport] Responses effort uses nested reasoning object and separate cached evidence (1.23s)
-PASS [EffortTransport] Invalid effort fails before any HTTP or cache write (0.02s)
-PASS [EffortTransport] Shared plan merges desktop levels and keeps unrelated desktop options and metadata unchanged with no setting (0.59s)
-PASS [EffortTransport] Shared plan adds exactly one desktop table and validates default effort (0.06s)
-RESULT Passed=4 Failed=0 Total=4 PS=7.6.10

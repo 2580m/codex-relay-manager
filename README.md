@@ -157,7 +157,7 @@ requires_openai_auth = false
 3. 确认显示“配置已写入”，完全退出并重新打开 App，再新建会话。
 4. 配置成功不代表真实网关调用成功；若 App 报凭据助手或协议错误，不会退化明文，请先查看版本与兼容性记录。
 
-共享配置中的认证使用 `[model_providers.<id>.auth]`，命令和参数均为绝对路径/非秘密数据。Windows PowerShell 凭据助手从当前用户 DPAPI 密文取 Key，stdout 仅返回纯文本 token，不返回 JSON，异常只输出固定无秘密诊断。不设置 `env_key`，不写 `experimental_bearer_token`，不改变已有 ChatGPT 登录。当前实测协议以 Codex `0.167.1` 为基准；App GUI 是否实际调用成功单独报告。
+共享配置中的认证使用 `[model_providers.<id>.auth]`，命令和参数均为绝对路径/非秘密数据。Windows PowerShell 凭据助手从当前用户 DPAPI 密文取 Key，stdout 仅返回纯文本 token，不返回 JSON，失败 stderr 输出阶段 `stage`、白名单安全原因 `reason`、最深异常类型及 HRESULT；不输出原始异常消息/堆栈、JSON 内容、密钥或密文。不设置 `env_key`，不写 `experimental_bearer_token`，不改变已有 ChatGPT 登录。当前实测协议以 Codex `0.167.1` 为基准；App GUI 是否实际调用成功单独报告。
 
 恢复使用菜单 `[10]`，只有当前文件仍匹配该次写入指纹才自动恢复；若已手动编辑，必须先处理冲突，不会整份覆盖你的新设置。正在被共享配置引用的 Provider 不允许直接清理、删除或更换地址/密钥，请先恢复解除接入。备份可能包含你原配置中已经存在的敏感字段，按密钥文件同等保护，不要上传或同步到公共仓库。进程若在替换成功而事务记录尚未完成时崩溃，可能遗留 `Prepared`；工具会阻止误删引用，但不会猜测自动恢复，需要人工核对记录中的原/新指纹与备份。恢复原文件后若最后记录写入失败，也需核对原指纹，不要强制覆盖后续编辑。跨文件补偿不是系统级崩溃原子事务。
 
@@ -213,7 +213,9 @@ requires_openai_auth = false
 └── logs\
 ```
 
-可以用 `-DataDirectory 'D:\private\codex-relay-data'` 指定**专用目录**，不要指向项目根目录或与其他应用共享的目录。初始化会收紧该目录 ACL，仅当前 Windows 用户和 SYSTEM 完全控制；拒绝数据目录重解析点。默认不写运行日志，`logs` 目录预留；不记录网络正文或密钥。
+可以用 `-DataDirectory 'D:\private\codex-relay-data'` 指定**专用目录**，不要指向项目根目录或与其他应用共享的目录。初始化会收紧该目录 ACL，当前 Windows 用户和 SYSTEM 完全控制；若本机存在 `CodexSandboxUsers`，按本机账户解析 SID，仅授予/接受读取与执行（含 Synchronize），不接受其写入、修改或完全控制；其他额外账户仍拒绝。拒绝数据目录重解析点。默认不写运行日志，`logs` 目录预留；不记录网络正文或密钥。
+
+**权限作用范围：**以上只读限制仅用于专用 `.codex-relay` 凭据/管理器数据，不是 Agent 项目工作区。工具不把项目目录改为只读，不修改 Codex 的工作区写入沙箱或审批；Agent 在项目中原有的修改权限保持不变。若确需让 Agent 改管理器数据，应由管理器提供明确操作，而不是让沙箱任意改写可解密 Key 的助手脚本。共享配置备份目录继续单独限制当前用户和 SYSTEM。
 
 API Key 用 Windows **DPAPI `CurrentUser`** 加密后 Base64 存储。解密通常需要原 Windows 用户和可用的 DPAPI 用户配置；只拷贝 JSON 到另一用户/设备不保证能解密。解密失败时可通过编辑菜单重录 Key。非 Windows 明确拒绝运行，不回退明文。磁盘写入先写同目录临时文件再原子替换，进程间互斥锁防止并发写覆盖；损坏 JSON 不自动覆盖，先提示备份修复。
 
@@ -236,7 +238,9 @@ API Key 用 Windows **DPAPI `CurrentUser`** 加密后 Base64 存储。解密通�
 | 只有 Chat Completions | 不会伪装为 Responses；需要网关提供真正兼容的 `/responses` |
 | 流 200 却未通过 | 检查 SSE Content-Type、生命周期、delta、completed，不要将普通 JSON 或 `[DONE]` 当 Responses |
 | 文本通过但 Codex 工具失败 | 网关还需实现工具调用及多轮上下文；最小探测不是完整工具兼容认证 |
-| 密钥无法解密 | 用原用户运行，或在编辑菜单重录；不要尝试回退明文 |
+| 密钥无法解密 | 根据 `stage=DPAPI_DECRYPT` 和 HRESULT 检查原用户/用户配置，或重新录入；不要退回明文 |
+| 助手 `stage=ROOT_ACL` | 根目录权限校验失败。当前允许本机 `CodexSandboxUsers` 的只读执行权限，不再把正常沙箱组判为未知账户；若该组有写入/修改权限，或其他账户获授权，仍明确拒绝。不要对项目目录应用凭据 ACL |
+| 助手其他阶段失败 | `DATA_PATH` 为路径，`HELPER_*` 为助手位置/权限，`PROVIDER_RECORD` 为数据读取校验，`TOKEN_VALIDATION` 为解密后格式。错误含安全原因、异常类型和 HRESULT，不要自行打印 stdout（成功时是密钥） |
 | 数据文件损坏 | 先备份提示的 JSON，修复格式或移到独立备份目录后重录；不会静默覆盖 |
 | ACL 设置失败 | 用当前用户可控制的本地专用目录；不要改为公开可读目录 |
 
