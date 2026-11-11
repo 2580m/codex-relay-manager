@@ -1,0 +1,31 @@
+PASS AST parsing (current engine + Windows PowerShell 5.1)
+PASS [Catalog] 路径按 Provider 隔离且查询不创建目录 (0.11s)
+PASS [Catalog] 拒绝大写和路径穿越 Provider ID (0.02s)
+PASS [Catalog] 批量生成官方目录与无 key 无默认模型的独立 TOML (0.16s)
+PASS [Catalog] 精确官方 gpt-6.1-sol 使用自身完整模板而非 gpt-5.5 能力 (0.05s)
+PASS [Catalog] 非官方别名保留原 slug 且仅精确大小写匹配官方模板不升级模型 (0.10s)
+PASS [Catalog] 官方目录和新模型深复制不污染后续模板或其它别名 (0.05s)
+PASS [Catalog] 按 slug 增量合并并保留根字段和自定义 metadata (0.06s)
+PASS [Catalog] 不同 Provider 同名模型独立且 Clear 保留其它 Provider 和用户文件 (0.10s)
+PASS [Catalog] 空批量和控制字符在写入前全部拒绝 (0.03s)
+PASS [Catalog] 损坏目录和缺官方字段拒绝覆盖原件 (0.04s)
+PASS [Catalog] 重复现有 slug 拒绝合并以免丢失自定义 metadata (0.03s)
+PASS [Catalog] 含凭据 URL 或独立配置拒绝备份和写入 (0.05s)
+PASS [Catalog] 第二文件提交失败时回滚目录并清除暂存文件 (0.05s)
+#< CLIXML
+<Objs Version="1.1.0.1" xmlns="http://schemas.microsoft.com/powershell/2004/04"><Obj S="progress" RefId="0"><TN RefId="0"><T>System.Management.Automation.PSCustomObject</T><T>System.Object</T></TN><MS><I64 N="SourceId">1</I64><PR N="Record"><AV>正在准备首次使用模块。</AV><AI>0</AI><Nil /><PI>-1</PI><PC>-1</PC><T>Completed</T><SR>-1</SR><SD> </SD></PR></MS></Obj></Objs>PASS [Catalog] 原始七对启动参数不变且追加 catalog override 与模板默认 effort (0.33s)
+OFFICIAL CATALOG model/list loaded: catalog-f3920b623c454961b28343d2681103c9, catalog-4deeff8cca564952aafe72c32cf80a08
+OFFICIAL CATALOG negative: Error: failed to parse model_catalog_json path `C:\Users\idk Ma\AppData\Local\Temp\relay-tests-97dbc63e2e0f4329abb596dae759dcc6\catalog\relay_9fdb669cb2eb414eba8da526be0e90f7\models.json` as JSON: missing field `shell_type` at line 98 column 5
+PASS [Catalog] 官方0.167.1隔离 CLI 确实加载 Add 产物并拒绝无效 schema (2.31s)
+PASS [CredentialHelper] preview has no side effects; install returns static absolute auth config (0.12s)
+PASS [CredentialHelper] independent PS5 child emits exact UTF8 token only; same model different provider stays isolated (0.94s)
+PASS [CredentialHelper] unknown invalid traversal uppercase and control-character provider IDs fail without stdout (1.10s)
+PASS [CredentialHelper] malformed JSON malicious ciphertext DPAPI failures duplicates and control tokens fail closed (3.66s)
+PASS [CredentialHelper] modified helper is preserved and refused rather than silently overwritten (0.02s)
+PASS [CredentialHelper] unprotected root and non-inheriting or broad child ACL are refused without ACL repair (0.64s)
+PASS [CredentialHelper] junction in an ancestor or credentials directory is rejected (0.39s)
+PASS [CredentialHelper] missing store root is never initialized and no parent process environment is changed (0.32s)
+OFFICIAL shared-config+catalog+external-auth verified: provider=relay_f6723393f16c4094be9d700ea793f264 config/read=true model/list=true model=model-a exit=0 loopbackBearer=true
+OFFICIAL shared-config+catalog+external-auth verified: provider=relay_1ae2705d17174da88242e332e62d1296 config/read=true model/list=true model=model-a exit=0 loopbackBearer=true
+PASS [CredentialHelper] official 0.167.1 isolated CLI parses external auth and sends real provider-specific Bearer to loopback (10.47s)
+RESULT Passed=24 Failed=0 Total=24 PS=7.6.10

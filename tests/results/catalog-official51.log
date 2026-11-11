@@ -1,0 +1,17 @@
+PASS AST parsing (current engine + Windows PowerShell 5.1)
+PASS [Catalog] 路径按 Provider 隔离且查询不创建目录 (0.13s)
+PASS [Catalog] 拒绝大写和路径穿越 Provider ID (0.06s)
+PASS [Catalog] 批量生成官方目录与无 key 无默认模型的独立 TOML (0.13s)
+PASS [Catalog] 按 slug 增量合并并保留根字段和自定义 metadata (0.06s)
+PASS [Catalog] 不同 Provider 同名模型独立且 Clear 保留其它 Provider 和用户文件 (0.08s)
+PASS [Catalog] 空批量和控制字符在写入前全部拒绝 (0.04s)
+PASS [Catalog] 损坏目录和缺官方字段拒绝覆盖原件 (0.06s)
+PASS [Catalog] 重复现有 slug 拒绝合并以免丢失自定义 metadata (0.05s)
+PASS [Catalog] 含凭据 URL 或独立配置拒绝备份和写入 (0.05s)
+PASS [Catalog] 第二文件提交失败时回滚目录并清除暂存文件 (0.06s)
+#< CLIXML
+<Objs Version="1.1.0.1" xmlns="http://schemas.microsoft.com/powershell/2004/04"><Obj S="progress" RefId="0"><TN RefId="0"><T>System.Management.Automation.PSCustomObject</T><T>System.Object</T></TN><MS><I64 N="SourceId">1</I64><PR N="Record"><AV>正在准备首次使用模块。</AV><AI>0</AI><Nil /><PI>-1</PI><PC>-1</PC><T>Completed</T><SR>-1</SR><SD> </SD></PR></MS></Obj></Objs>PASS [Catalog] 原始七对启动参数不变且 catalog override 可独立追加 (0.34s)
+OFFICIAL CATALOG model/list loaded: catalog-396c0ff6b4794fff9ee898ce5ac3b502, catalog-e72c5bd627c34f3f965e44788f9b5311
+OFFICIAL CATALOG negative: Error: failed to parse model_catalog_json path `C:\Users\idk Ma\AppData\Local\Temp\relay-tests-653e58b899214071be393e78b4c47a44\catalog\relay_083bd6dd02394c2cbb57153db87507f8\models.json` as JSON: missing field `shell_type` at line 36 column 20
+PASS [Catalog] 官方0.167.1隔离 CLI 确实加载 Add 产物并拒绝无效 schema (2.33s)
+RESULT Passed=12 Failed=0 Total=12 PS=5.1.26100.9711

@@ -1,0 +1,235 @@
+﻿{
+    "Engine":  "5.1.26100.9711",
+    "Runner":  "Standalone",
+    "ScriptPath":  "W:\\Work\\codex-relay\\codex-relay-manager\\codex-relay.ps1",
+    "TimestampUtc":  "2026-11-11T14:10:32.8750410Z",
+    "Passed":  32,
+    "Failed":  0,
+    "Total":  32,
+    "Tests":  [
+                  {
+                      "Suite":  "Interaction",
+                      "Name":  "Status colors distinguish untested, compatible, unavailable and transient errors",
+                      "Passed":  true,
+                      "Seconds":  0.0618164,
+                      "Error":  null
+                  },
+                  {
+                      "Suite":  "Interaction",
+                      "Name":  "Model list passes the right color and normalized status to Write-RelaySafe",
+                      "Passed":  true,
+                      "Seconds":  0.0662693,
+                      "Error":  null
+                  },
+                  {
+                      "Suite":  "Interaction",
+                      "Name":  "Batch accepts 1,3 then 2 then 00 in selection order",
+                      "Passed":  true,
+                      "Seconds":  0.047396,
+                      "Error":  null
+                  },
+                  {
+                      "Suite":  "Interaction",
+                      "Name":  "Batch deduplicates within and across lines without reordering",
+                      "Passed":  true,
+                      "Seconds":  0.028726699999999997,
+                      "Error":  null
+                  },
+                  {
+                      "Suite":  "Interaction",
+                      "Name":  "Batch 0 discards all selections and returns no items",
+                      "Passed":  true,
+                      "Seconds":  0.0506752,
+                      "Error":  null
+                  },
+                  {
+                      "Suite":  "Interaction",
+                      "Name":  "Empty 00 does not finish and permits subsequent selection",
+                      "Passed":  true,
+                      "Seconds":  0.026312799999999997,
+                      "Error":  null
+                  },
+                  {
+                      "Suite":  "Interaction",
+                      "Name":  "Invalid batch lines are atomic including mixed 0 and 00 tokens",
+                      "Passed":  true,
+                      "Seconds":  0.13598839999999998,
+                      "Error":  null
+                  },
+                  {
+                      "Suite":  "Interaction",
+                      "Name":  "An invalid batch line preserves earlier valid selections only",
+                      "Passed":  true,
+                      "Seconds":  0.027493899999999998,
+                      "Error":  null
+                  },
+                  {
+                      "Suite":  "Interaction",
+                      "Name":  "Batch supports Chinese commas and surrounding whitespace",
+                      "Passed":  true,
+                      "Seconds":  0.029572099999999997,
+                      "Error":  null
+                  },
+                  {
+                      "Suite":  "Interaction",
+                      "Name":  "Menu 2 probes only selected models after two YES confirmations",
+                      "Passed":  true,
+                      "Seconds":  0.0451407,
+                      "Error":  null
+                  },
+                  {
+                      "Suite":  "Interaction",
+                      "Name":  "Menu 2 cancellation never probes or asks for billing confirmation",
+                      "Passed":  true,
+                      "Seconds":  0.0342288,
+                      "Error":  null
+                  },
+                  {
+                      "Suite":  "Interaction",
+                      "Name":  "Menu 2 declining either confirmation prevents every probe",
+                      "Passed":  true,
+                      "Seconds":  0.0778788,
+                      "Error":  null
+                  },
+                  {
+                      "Suite":  "Interaction",
+                      "Name":  "Menu 3 probes all cached models in cache order after two confirmations",
+                      "Passed":  true,
+                      "Seconds":  0.026966399999999998,
+                      "Error":  null
+                  },
+                  {
+                      "Suite":  "Interaction",
+                      "Name":  "Menu 3 declining either confirmation prevents every probe",
+                      "Passed":  true,
+                      "Seconds":  0.0305936,
+                      "Error":  null
+                  },
+                  {
+                      "Suite":  "Interaction",
+                      "Name":  "Menu 1 preserves single-model selection and one YES confirmation",
+                      "Passed":  true,
+                      "Seconds":  0.0290453,
+                      "Error":  null
+                  },
+                  {
+                      "Suite":  "Interaction",
+                      "Name":  "Menu 1 cancellation or declined confirmation does not probe",
+                      "Passed":  true,
+                      "Seconds":  0.0394065,
+                      "Error":  null
+                  },
+                  {
+                      "Suite":  "Interaction",
+                      "Name":  "Compatibility menu return or invalid choice makes no calls",
+                      "Passed":  true,
+                      "Seconds":  0.0385897,
+                      "Error":  null
+                  },
+                  {
+                      "Suite":  "Interaction",
+                      "Name":  "Compatibility UI colors probe results through the real status mapper",
+                      "Passed":  true,
+                      "Seconds":  0.0639716,
+                      "Error":  null
+                  },
+                  {
+                      "Suite":  "Interaction",
+                      "Name":  "Catalog menu 2 shares comma selection, repeated lines and 00 completion",
+                      "Passed":  true,
+                      "Seconds":  0.0401391,
+                      "Error":  null
+                  },
+                  {
+                      "Suite":  "Interaction",
+                      "Name":  "Catalog batch empty 00 continues and invalid lines remain atomic",
+                      "Passed":  true,
+                      "Seconds":  0.0321221,
+                      "Error":  null
+                  },
+                  {
+                      "Suite":  "Interaction",
+                      "Name":  "Catalog batch 0 discards prior choices without an import or confirmation",
+                      "Passed":  true,
+                      "Seconds":  0.032076099999999996,
+                      "Error":  null
+                  },
+                  {
+                      "Suite":  "Interaction",
+                      "Name":  "Catalog declines file writes unless the answer is exactly YES",
+                      "Passed":  true,
+                      "Seconds":  0.0561232,
+                      "Error":  null
+                  },
+                  {
+                      "Suite":  "Interaction",
+                      "Name":  "Catalog menu 1 imports only the chosen model and menu 3 imports the cache",
+                      "Passed":  true,
+                      "Seconds":  0.0334377,
+                      "Error":  null
+                  },
+                  {
+                      "Suite":  "Interaction",
+                      "Name":  "Shared preview conflicts abort before confirmation and perform zero writes",
+                      "Passed":  true,
+                      "Seconds":  0.045864499999999996,
+                      "Error":  null
+                  },
+                  {
+                      "Suite":  "Interaction",
+                      "Name":  "Default selection rejects implicit and invalid choices before selecting a nonfirst model",
+                      "Passed":  true,
+                      "Seconds":  0.0658358,
+                      "Error":  null
+                  },
+                  {
+                      "Suite":  "Interaction",
+                      "Name":  "Default 0 cancels every catalog mode before credential or shared previews",
+                      "Passed":  true,
+                      "Seconds":  0.03929,
+                      "Error":  null
+                  },
+                  {
+                      "Suite":  "Interaction",
+                      "Name":  "Catalog menu cancellation and invalid choices never preview or publish",
+                      "Passed":  true,
+                      "Seconds":  0.039394399999999996,
+                      "Error":  null
+                  },
+                  {
+                      "Suite":  "Interaction",
+                      "Name":  "Restore UI empty history returns without prompts or writes",
+                      "Passed":  true,
+                      "Seconds":  0.026121199999999997,
+                      "Error":  null
+                  },
+                  {
+                      "Suite":  "Interaction",
+                      "Name":  "Restore UI uses the selected history transaction only after exact YES",
+                      "Passed":  true,
+                      "Seconds":  0.034123099999999996,
+                      "Error":  null
+                  },
+                  {
+                      "Suite":  "Interaction",
+                      "Name":  "Restore UI cancellation and inexact confirmation never restore",
+                      "Passed":  true,
+                      "Seconds":  0.0543028,
+                      "Error":  null
+                  },
+                  {
+                      "Suite":  "Interaction",
+                      "Name":  "Restore UI conflict propagates without claiming a successful restore",
+                      "Passed":  true,
+                      "Seconds":  0.028849,
+                      "Error":  null
+                  },
+                  {
+                      "Suite":  "Interaction",
+                      "Name":  "Mocks and selection state are restored even when a scenario throws",
+                      "Passed":  true,
+                      "Seconds":  0.053120299999999995,
+                      "Error":  null
+                  }
+              ]
+}

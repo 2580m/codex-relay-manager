@@ -1,0 +1,25 @@
+﻿{
+  "Engine": "7.6.10",
+  "Runner": "Standalone",
+  "ScriptPath": "W:\\Work\\codex-relay\\codex-relay-manager\\codex-relay.ps1",
+  "TimestampUtc": "2026-11-11T14:41:29.3364568Z",
+  "Passed": 2,
+  "Failed": 0,
+  "Total": 2,
+  "Tests": [
+    {
+      "Suite": "EffortPublish",
+      "Name": "Publish commits API-accepted model metadata, shared default and desktop choices together",
+      "Passed": true,
+      "Seconds": 1.1084003,
+      "Error": null
+    },
+    {
+      "Suite": "EffortPublish",
+      "Name": "Rejected shared commit restores metadata from before the effort update",
+      "Passed": true,
+      "Seconds": 0.0940923,
+      "Error": null
+    }
+  ]
+}

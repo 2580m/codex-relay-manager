@@ -1,0 +1,175 @@
+PASS AST parsing (current engine + Windows PowerShell 5.1)
+
+
+
+
+
+PASS AST parsing (current engine + Windows PowerShell 5.1)
+Describing Relay Catalog
+ [+] 路径按 Provider 隔离且查询不创建目录 3.38s
+ [+] 拒绝大写和路径穿越 Provider ID 118ms
+ [+] 批量生成官方目录与无 key 无默认模型的独立 TOML 283ms
+ [+] 精确官方 gpt-6.1-sol 使用自身完整模板而非 gpt-5.5 能力 133ms
+ [+] 非官方别名保留原 slug 且仅精确大小写匹配官方模板不升级模型 239ms
+ [+] 官方目录和新模型深复制不污染后续模板或其它别名 144ms
+ [+] 按 slug 增量合并并保留根字段和自定义 metadata 128ms
+ [+] 不同 Provider 同名模型独立且 Clear 保留其它 Provider 和用户文件 189ms
+ [+] 空批量和控制字符在写入前全部拒绝 97ms
+ [+] 损坏目录和缺官方字段拒绝覆盖原件 102ms
+ [+] 重复现有 slug 拒绝合并以免丢失自定义 metadata 99ms
+ [+] 含凭据 URL 或独立配置拒绝备份和写入 110ms
+ [+] 第二文件提交失败时回滚目录并清除暂存文件 123ms
+#< CLIXML
+<Objs Version="1.1.0.1" xmlns="http://schemas.microsoft.com/powershell/2004/04"><Obj S="progress" RefId="0"><TN RefId="0"><T>System.Management.Automation.PSCustomObject</T><T>System.Object</T></TN><MS><I64 N="SourceId">1</I64><PR N="Record"><AV>正在准备首次使用模块。</AV><AI>0</AI><Nil /><PI>-1</PI><PC>-1</PC><T>Completed</T><SR>-1</SR><SD> </SD></PR></MS></Obj></Objs> [+] 原始七对启动参数不变且追加 catalog override 与模板默认 effort 410ms
+Describing Relay ConfigGeneration
+ [+] TOML basic strings round-trip quotes, slashes, Unicode and control characters 140ms
+ [+] Seven config pairs select Responses and disable OpenAI authentication 119ms
+ [+] Win32 escaping round-trips exact argv through a real recorder executable 108ms
+ [+] Start launches only the recorder with exact argv and child-only API key 180ms
+ [+] Native launch injects an absent key only into the child 110ms
+ [+] Missing executable fails without changing parent key 74ms
+Describing Relay CredentialHelper
+ [+] preview has no side effects; install returns static absolute auth config 147ms
+ [+] independent PS5 child emits exact UTF8 token only; same model different provider stays isolated 1.08s
+ [+] unknown invalid traversal uppercase and control-character provider IDs fail without stdout 1.16s
+ [+] malformed JSON malicious ciphertext DPAPI failures duplicates and control tokens fail closed 3.84s
+ [+] modified helper is preserved and refused rather than silently overwritten 79ms
+ [+] unprotected root and non-inheriting or broad child ACL are refused without ACL repair 676ms
+ [+] junction in an ancestor or credentials directory is rejected 443ms
+ [+] missing store root is never initialized and no parent process environment is changed 381ms
+Describing Relay Effort
+ [+] 固定七个预定义探测等级不混入 ultra；模型列表仍由调用方提供 70ms
+ [+] 0不设置既不请求不确认也不改已有目录；空设置 Apply 无写入 131ms
+ [+] 单模型取消序号或费用确认不发生请求；全部二次拒绝无费用 73ms
+ [+] 单模型仅请求指定模型基线加七候选；单次费用确认及固定免责声明 85ms
+ [+] 全部检测双确认并按模型去重；基线不兼容不探测该模型等级 69ms
+ [+] 所有非兼容分类不标支持；零 accepted 不生成空设置 73ms
+ [+] 认证限流网络错误仅停止当前模型剩余探测并保留先前 accepted 78ms
+ [+] 默认保留已有 accepted 等级否则选首个 accepted 而非隐选 high 102ms
+ [+] Apply只改选中模型两个effort字段保留所有metadata并备份原字节 154ms
+ [+] 未知模型大小写差异无效默认及未知等级整批拒绝且不创建备份 121ms
+ [+] 损坏catalog不覆盖且写入失败保留原件和备份；共享stub失败后恢复 99ms
+Describing Relay EffortPublish
+ [+] Publish commits API-accepted model metadata, shared default and desktop choices together 394ms
+ [+] Rejected shared commit restores metadata from before the effort update 152ms
+Describing Relay EffortTransport
+ [+] Responses effort uses nested reasoning object and separate cached evidence 1.25s
+ [+] Invalid effort fails before any HTTP or cache write 114ms
+ [+] Shared plan merges desktop levels and keeps unrelated desktop options and metadata unchanged with no setting 117ms
+ [+] Shared plan adds exactly one desktop table and validates default effort 87ms
+Describing Relay Interaction
+ [+] Status colors distinguish untested, compatible, unavailable and transient errors 73ms
+ [+] Model list passes the right color and normalized status to Write-RelaySafe 96ms
+ [+] Batch accepts 1,3 then 2 then 00 in selection order 75ms
+ [+] Batch deduplicates within and across lines without reordering 69ms
+ [+] Batch 0 discards all selections and returns no items 77ms
+ [+] Empty 00 does not finish and permits subsequent selection 64ms
+ [+] Invalid batch lines are atomic including mixed 0 and 00 tokens 156ms
+ [+] An invalid batch line preserves earlier valid selections only 64ms
+ [+] Batch supports Chinese commas and surrounding whitespace 67ms
+ [+] Menu 2 probes only selected models after two YES confirmations 78ms
+ [+] Menu 2 cancellation never probes or asks for billing confirmation 73ms
+ [+] Menu 2 declining either confirmation prevents every probe 128ms
+ [+] Menu 3 probes all cached models in cache order after two confirmations 68ms
+ [+] Menu 3 declining either confirmation prevents every probe 68ms
+ [+] Menu 1 preserves single-model selection and one YES confirmation 65ms
+ [+] Menu 1 cancellation or declined confirmation does not probe 80ms
+ [+] Compatibility menu return or invalid choice makes no calls 82ms
+ [+] Compatibility UI colors probe results through the real status mapper 89ms
+ [+] Catalog menu 2 shares comma selection, repeated lines and 00 completion 85ms
+ [+] Catalog batch empty 00 continues and invalid lines remain atomic 70ms
+ [+] Catalog batch 0 discards prior choices without an import or confirmation 76ms
+ [+] Catalog declines file writes unless the answer is exactly YES 99ms
+ [+] Catalog menu 1 imports only the chosen model and menu 3 imports the cache 76ms
+ [+] Selected models reach effort UI and settings pass unchanged to plan and publish 73ms
+ [+] Effort settings failure aborts before default, credential preview and publish 82ms
+ [+] Shared preview conflicts abort before confirmation and perform zero writes 80ms
+ [+] Default selection rejects implicit and invalid choices before selecting a nonfirst model 116ms
+ [+] Default 0 cancels every catalog mode before credential or shared previews 78ms
+ [+] Catalog menu cancellation and invalid choices never preview or publish 82ms
+ [+] Restore UI empty history returns without prompts or writes 65ms
+ [+] Restore UI uses the selected history transaction only after exact YES 72ms
+ [+] Restore UI cancellation and inexact confirmation never restore 100ms
+ [+] Restore UI conflict propagates without claiming a successful restore 64ms
+ [+] Mocks and selection state are restored even when a scenario throws 84ms
+Describing Relay ModelDiscovery
+ [+] Provider creation is offline and stores only an encrypted key 113ms
+ [+] Models are fetched with bearer authentication and cached as strings 127ms
+ [+] Duplicate model IDs are deduplicated 63ms
+ [+] Empty model discovery is readable, preserves provider and never invents models 66ms
+ [+] Caches are isolated by provider and refreshed on successful fetch 125ms
+ [+] Cache lookup performs no network I/O and does not expose another store 157ms
+ [+] Failed refresh preserves the previous cache byte-for-byte logically 1.5s
+ [+] HTTP model failures throw readable classified errors without secrets 322ms
+ [+] Empty, non-JSON and invalid model payloads fail readably 323ms
+ [+] Model timeout is bounded and identified 1.08s
+ [+] Path-selected fixture works with a custom preserved API root 75ms
+Describing Relay OfficialTemplates
+ [+] 官方 document 完整 schema、精确模板 clone 与只读 source 521ms
+ [+] 未知及大小写不同 ID 使用完整 GPT5.5 fallback 且绝不改写 route 256ms
+ [+] 全部升级覆盖旧 placeholder、完整备份且保留 custom metadata 和未知显示名称 239ms
+ [+] 选择升级只改目标且显式空 Models 默认全部 230ms
+ [+] 无 caller settings 也保留已有 API accepted effort 等级描述及默认值 234ms
+ [+] 实际 API evidence cache 支持的非空 effort 不被模板默认值覆盖且 cache 只读 146ms
+ [+] 未知目标或大小写差异使整个 batch 写入及备份前拒绝 136ms
+ [+] 相同 slug 的 Provider 隔离且升级不访问任何模型或 Responses API 168ms
+ [+] shared config 已引用时可原路径升级不删除目录且 config hash 不变 189ms
+ [+] 升级复用 StoreLock 和 WriteJSON 且注入写失败保留原文件与逐字节备份 143ms
+Describing Relay Publish
+ [+] Publishing and restoring protects referenced provider and leaves no plaintext key 245ms
+ [+] Concurrent config edit aborts publishing and restores prior catalog bytes 155ms
+ [+] CLI uses fresh provider ID to avoid persistent auth and env_key conflict 171ms
+Describing Relay ResponsesSSE
+ [+] Chunked UTF-8 SSE with delta and completed is compatible 479ms
+ [+] Lifecycle plus completed without output is not a successful minimal text probe 431ms
+ [+] Delta without completed and completed without lifecycle are not compatible 1.3s
+ [+] HTTP 200 JSON/HTML/empty must never be treated as SSE compatibility 228ms
+ [+] SSE error and response.failed have failure priority over completion 0.99s
+ [+] Malformed SSE JSON cannot count as valid lifecycle evidence 257ms
+ [+] Responses HTTP failures return classifications instead of throwing 329ms
+ [+] Timeout applies after headers and initial SSE event, not only before headers 1.08s
+ [+] Pre-header timeout returns a timeout classification 1.07s
+ [+] Compatibility records persist and remain isolated by provider 715ms
+ [+] Empty compatibility history is returned without contacting the network 114ms
+Describing Relay SharedConfig
+ [+] 显式路径优先与CODEX_HOME解析不创建文件 78ms
+ [+] 无历史引用检查不读取CODEX_HOME 68ms
+ [+] 空配置计划不落盘并生成nested auth 79ms
+ [+] 保留未知表注释数组quoted dotted与multiline所有字符 74ms
+ [+] BOM CRLF备份逐bytes恢复并限制ACL 122ms
+ [+] 恢复原本不存在配置并保留manifest历史 91ms
+ [+] 外部编辑使提交和恢复拒写且引用保守保护 110ms
+ [+] 手动解除所有引用后允许编辑但仅catalog引用仍保护 85ms
+ [+] 重复接入owned auth无重复表且额外headers原文保留 119ms
+ [+] 已有provider非auth字段安全合并保留额外设置 73ms
+ [+] 激活冲突逐个拒绝不改原文 89ms
+ [+] 外部拥有auth env token不接管且诊断不泄露内容 83ms
+ [+] owned auth被手改后拒绝再次接入 87ms
+ [+] 重复非法及复杂目标语法failclosed不落盘 63ms
+ [+] quoted root keys可编辑而dotted目标明确拒绝 75ms
+ [+] UTF16及损坏UTF8拒绝且不改bytes 73ms
+ [+] 同路径不同DataDirectory计划防止stale覆盖 93ms
+ [+] owned非auth受管字段手改后拒绝覆盖 90ms
+ [+] 未拥有同ID身份冲突不接管 64ms
+ [+] TOML键严格区分大小写并验证新增字段真实section 71ms
+ [+] 无效表ancestor覆盖拒绝 62ms
+ [+] Prepared潜在提交证据仍保护引用 81ms
+ [+] 备份被改拒绝恢复 89ms
+Describing Relay Storage
+ [+] Store initialization is idempotent and an empty provider list is empty 70ms
+ [+] JSON Unicode, nested values and arrays round-trip 68ms
+ [+] Missing JSON returns default; corrupt JSON never executes or overwrites data 62ms
+ [+] JSON empty and singleton arrays preserve their structure on disk 65ms
+ [+] DPAPI ciphertext round-trips for the current Windows account and is randomized 69ms
+ [+] Malformed/tampered ciphertext fails readably rather than yielding a key 72ms
+ [+] Providers persist, update by ID without duplication and delete independently 89ms
+ [+] Provider stores remain independent across data directories 70ms
+ [+] Stored model and compatibility data do not leak across same-name providers 487ms
+Describing Relay UrlNormalization
+ [+] Root, v1 and endpoint suffixes normalize without duplication 79ms
+ [+] Unknown custom paths require an explicit choice 69ms
+ [+] Custom API roots with recognized v1/endpoints preserve their prefix 69ms
+ [+] Invalid or unsafe base URLs are rejected 67ms
+ [+] Normalization performs no HTTP requests 140ms
+Tests completed in 37.28s
+Passed: 151 Failed: 0 Skipped: 0 Pending: 0 Inconclusive: 0
