@@ -3,15 +3,30 @@
 param(
     [switch]$LibraryOnly,
     [string]$DataDirectory = (Join-Path ([Environment]::GetFolderPath('UserProfile')) '.codex-relay'),
-    [string]$CredentialBaseDirectory = (Join-Path ([Environment]::GetFolderPath('UserProfile')) '.codex-relay-private'),
+    [string]$CredentialBaseDirectory = '',
     [switch]$MigrateLegacyCredentials,
     [string]$CodexPath
 )
 
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
+
+function Get-RelayDefaultCredentialBaseDirectory {
+    if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
+        $common = [Environment]::GetFolderPath('CommonApplicationData')
+        $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+        return [IO.Path]::Combine($common, ('codex-relay-private-' + $sid))
+    }
+    return (Join-Path ([Environment]::GetFolderPath('UserProfile')) '.codex-relay-private')
+}
+
+if (-not $PSBoundParameters.ContainsKey('CredentialBaseDirectory')) {
+    $CredentialBaseDirectory = Get-RelayDefaultCredentialBaseDirectory
+}
+
 $script:RelayDataDirectory = $DataDirectory
 $script:RelayCredentialBaseDirectory = $CredentialBaseDirectory
+$script:RelayLegacyCredentialBaseDirectory = (Join-Path ([Environment]::GetFolderPath('UserProfile')) '.codex-relay-private')
 $script:RelayCodexPath = $CodexPath
 $script:RelaySelectedProvider = ''
 $script:RelaySelectedModel = ''
@@ -29,13 +44,22 @@ function Initialize-RelayStore {
     Assert-RelayWindows
     $script:RelayDataDirectory = [IO.Path]::GetFullPath($Path)
     Assert-RelayCredentialPath $script:RelayDataDirectory
-    $null = Get-RelayPrivatePaths
+    $paths = Get-RelayPrivatePaths
     $legacy = Join-Path $script:RelayDataDirectory 'providers.json'
-    if ([IO.File]::Exists($legacy)) {
+    $legacyPrivate = Get-RelayLegacyPrivatePaths
+    $hasLegacy = [IO.File]::Exists($legacy)
+    $hasLegacyPrivate = (-not $legacyPrivate.Root.Equals($paths.Root, [StringComparison]::OrdinalIgnoreCase)) -and [IO.File]::Exists($legacyPrivate.Providers)
+    if ($hasLegacy -or $hasLegacyPrivate) {
         if (-not $MigrateLegacy) { throw '检测到旧版凭据存储；请使用 -MigrateLegacyCredentials 启动以迁移密文及受管认证配置。' }
         # Inspect legacy permissions before changing them; repairing ACLs cannot establish provenance.
-        Assert-RelayCredentialAcl $script:RelayDataDirectory -Root
-        Assert-RelayCredentialAcl $legacy
+        if ($hasLegacy) {
+            Assert-RelayCredentialAcl $script:RelayDataDirectory -Root
+            Assert-RelayCredentialAcl $legacy
+        }
+        if ($hasLegacyPrivate) {
+            Assert-RelayLegacyPrivateSource -LegacyBase $legacyPrivate.Base -LegacyRoot $legacyPrivate.Root
+            Assert-RelayCredentialAcl $legacyPrivate.Providers
+        }
     }
     foreach ($directory in @($script:RelayDataDirectory, (Join-Path $Path 'cache'), (Join-Path $Path 'logs'))) {
         [void][IO.Directory]::CreateDirectory($directory)
@@ -64,11 +88,14 @@ function Initialize-RelayStore {
         }
     }
     Initialize-RelayPrivateStore
-    if ([IO.File]::Exists($legacy)) { Move-RelayLegacyCredentials -ConfigPath $ConfigPath }
+    if ($hasLegacy -or $hasLegacyPrivate) { Move-RelayLegacyCredentials -ConfigPath $ConfigPath }
     return $script:RelayDataDirectory
 }
 
 function Get-RelayPrivatePaths {
+    if ([string]::IsNullOrWhiteSpace($script:RelayDataDirectory) -or [string]::IsNullOrWhiteSpace($script:RelayCredentialBaseDirectory)) {
+        throw 'Invalid credential data path.'
+    }
     $data = [IO.Path]::GetFullPath($script:RelayDataDirectory).TrimEnd('\')
     $base = [IO.Path]::GetFullPath($script:RelayCredentialBaseDirectory).TrimEnd('\')
     if ($base.Equals($data, [StringComparison]::OrdinalIgnoreCase) -or $base.StartsWith($data + '\', [StringComparison]::OrdinalIgnoreCase) -or $data.StartsWith($base + '\', [StringComparison]::OrdinalIgnoreCase)) {
@@ -83,20 +110,95 @@ function Get-RelayPrivatePaths {
     return [pscustomobject]@{ Base=$base; Root=$root; Providers=(Join-Path $root 'providers.json'); Runtime=(Join-Path $data 'auth-runtime') }
 }
 
+function Get-RelayLegacyPrivatePaths {
+    if ([string]::IsNullOrWhiteSpace($script:RelayDataDirectory)) {
+        throw 'Invalid credential data path.'
+    }
+    $data = [IO.Path]::GetFullPath($script:RelayDataDirectory).TrimEnd('\')
+    $baseRaw = if ($script:RelayLegacyCredentialBaseDirectory) { $script:RelayLegacyCredentialBaseDirectory } else { (Join-Path ([Environment]::GetFolderPath('UserProfile')) '.codex-relay-private') }
+    $base = [IO.Path]::GetFullPath($baseRaw).TrimEnd('\')
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try { $id = [BitConverter]::ToString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($data.ToUpperInvariant()))).Replace('-', '').ToLowerInvariant() }
+    finally { $sha.Dispose() }
+    $root = Join-Path $base $id
+    return [pscustomobject]@{ Base=$base; Root=$root; Providers=(Join-Path $root 'providers.json'); Helper=(Join-Path $root 'credentials\credential-helper.ps1') }
+}
+
+function Test-RelaySandboxSid {
+    param([Parameter(Mandatory)][Security.Principal.SecurityIdentifier]$Sid, [string]$CodexSandboxSid)
+    $value = $Sid.Value
+    if ($CodexSandboxSid -and $value -eq $CodexSandboxSid) { return $true }
+    if ($value -cnotmatch '\AS-1-5-21-\d+-\d+-\d+-\d+\z') { return $false }
+    $currentDomain = [Security.Principal.WindowsIdentity]::GetCurrent().User.AccountDomainSid
+    if ($currentDomain -and $Sid.AccountDomainSid -and $Sid.AccountDomainSid.Value -eq $currentDomain.Value) { return $false }
+    try {
+        $null = $Sid.Translate([Security.Principal.NTAccount])
+        return $false
+    } catch [Security.Principal.IdentityNotMappedException] {
+        return $true
+    }
+}
+
+function Assert-RelayLegacyPrivateSource {
+    param([Parameter(Mandatory)][string]$LegacyBase, [Parameter(Mandatory)][string]$LegacyRoot)
+    Assert-RelayCredentialPath $LegacyBase
+    Assert-RelayCredentialPath $LegacyRoot
+    Assert-RelayCredentialParents $LegacyBase
+    $acl = Get-RelayCredentialAcl $LegacyBase
+    if (-not $acl.AreAccessRulesProtected) { throw 'Credential root must have a protected ACL.' }
+    $userSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    $trusted = @($userSid, 'S-1-5-18', 'S-1-5-32-544', 'S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464')
+    if ($acl.GetOwner([Security.Principal.SecurityIdentifier]).Value -notin $trusted) { throw 'Untrusted credential ancestor owner.' }
+    $sandboxSid = Get-RelayCodexSandboxSid
+    $dangerous = [long]([Security.AccessControl.FileSystemRights]::Delete -bor [Security.AccessControl.FileSystemRights]::DeleteSubdirectoriesAndFiles -bor [Security.AccessControl.FileSystemRights]::ChangePermissions -bor [Security.AccessControl.FileSystemRights]::TakeOwnership) -bor [long]0x10000000 -bor [long]0x40000000 -bor [long]0x02000000
+    $sandboxModifyMask = [long]([Security.AccessControl.FileSystemRights]::Modify -bor [Security.AccessControl.FileSystemRights]::Synchronize)
+    foreach ($rule in $acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier])) {
+        if ($rule.AccessControlType -ne [Security.AccessControl.AccessControlType]::Allow) { continue }
+        if ($rule.PropagationFlags -band [Security.AccessControl.PropagationFlags]::InheritOnly) { continue }
+        $sid = [Security.Principal.SecurityIdentifier]$rule.IdentityReference
+        if ($sid.Value -in $trusted) { continue }
+        if (([long]$rule.FileSystemRights -band $dangerous) -eq 0) { continue }
+        if ((Test-RelaySandboxSid -Sid $sid -CodexSandboxSid $sandboxSid) -and (([long]$rule.FileSystemRights -band (-bnot $sandboxModifyMask)) -eq 0)) { continue }
+        throw 'Credential ancestor ACL permits replacement by another identity.'
+    }
+    Assert-RelayCredentialAcl $LegacyRoot -Root
+}
+
+function Assert-RelayCredentialProviderStoreBytes {
+    param([Parameter(Mandatory)][byte[]]$Bytes)
+    if ($Bytes.Length -le 0 -or $Bytes.Length -gt 4194304) { throw 'Invalid credential store size.' }
+    try { $text = (New-Object Text.UTF8Encoding($false, $true)).GetString($Bytes) }
+    catch { throw 'Credential store is not valid UTF-8.' }
+    if (-not $text.TrimStart().StartsWith('[')) { throw 'Credential store must be an array.' }
+    $decoded = $text | ConvertFrom-Json -ErrorAction Stop
+    $seen = @{}
+    foreach ($item in @($decoded)) {
+        if ($null -eq $item -or $null -eq $item.PSObject.Properties['Id'] -or $null -eq $item.PSObject.Properties['EncryptedApiKey']) { throw 'Invalid credential provider record.' }
+        Assert-RelayCredentialProviderId $item.Id
+        if ($seen.ContainsKey($item.Id)) { throw 'Duplicate credential Provider ID.' }
+        $seen[$item.Id] = $true
+        $cipher = $item.EncryptedApiKey
+        if ($cipher -isnot [string] -or $cipher.Length -lt 16 -or $cipher.Length -gt 131072 -or $cipher -cnotmatch '\A[A-Za-z0-9+/]+={0,2}\z') { throw 'Invalid credential ciphertext.' }
+        $rawCipher = [Convert]::FromBase64String($cipher)
+        if ($rawCipher.Length -gt 65536 -or [Convert]::ToBase64String($rawCipher) -cne $cipher) { throw 'Invalid credential ciphertext.' }
+    }
+}
+
 function Initialize-RelayPrivateStore {
     $paths = Get-RelayPrivatePaths
     Assert-RelayCredentialParents $paths.Base
     foreach ($directory in @($paths.Base, $paths.Root)) {
         if ([IO.Directory]::Exists($directory)) { Assert-RelayCredentialAcl $directory -Root; continue }
-        [void][IO.Directory]::CreateDirectory($directory)
         Assert-RelayCredentialPath $directory
         $acl = New-Object Security.AccessControl.DirectorySecurity
         $acl.SetAccessRuleProtection($true, $false)
         foreach ($sid in @([Security.Principal.WindowsIdentity]::GetCurrent().User, (New-Object Security.Principal.SecurityIdentifier('S-1-5-18')))) {
             [void]$acl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule($sid, 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow')))
         }
-        if ($PSVersionTable.PSEdition -eq 'Desktop') { [IO.Directory]::SetAccessControl($directory, $acl) }
-        else { [IO.FileSystemAclExtensions]::SetAccessControl((New-Object IO.DirectoryInfo($directory)), $acl) }
+        if ($PSVersionTable.PSEdition -eq 'Desktop') { [void][IO.Directory]::CreateDirectory($directory, $acl) }
+        else { [void][IO.FileSystemAclExtensions]::CreateDirectory($acl, $directory) }
+        Assert-RelayCredentialPath $directory
+        Assert-RelayCredentialAcl $directory -Root
     }
     Assert-RelayCredentialParents $paths.Root
 }
@@ -104,6 +206,10 @@ function Initialize-RelayPrivateStore {
 function Get-RelayProviderStorePath {
     $paths = Get-RelayPrivatePaths
     if ([IO.File]::Exists((Join-Path $script:RelayDataDirectory 'providers.json'))) { throw 'Legacy credential migration is incomplete; refusing to use a second credential store.' }
+    $legacyPrivate = Get-RelayLegacyPrivatePaths
+    if (-not $legacyPrivate.Root.Equals($paths.Root, [StringComparison]::OrdinalIgnoreCase) -and [IO.File]::Exists($legacyPrivate.Providers)) {
+        throw 'Legacy credential migration is incomplete; refusing to use a second credential store.'
+    }
     $root = Resolve-RelayCredentialRoot $paths.Root
     Assert-RelayCredentialParents $root
     Assert-RelayCredentialAcl $root -Root
@@ -120,22 +226,89 @@ function Test-RelayLegacyHelperBytes {
     return (Get-RelaySharedHash ([Text.Encoding]::UTF8.GetBytes($text))) -ceq 'b034c9fa5348a732cdb6babb6273ff1ec664056480eac8fe070b1d37dbbec25d'
 }
 
+function Test-RelayMigratableHelperBytes {
+    param([byte[]]$Bytes)
+    if (Test-RelayLegacyHelperBytes $Bytes) { return $true }
+    try { $text = (New-Object Text.UTF8Encoding($false, $true)).GetString($Bytes).Replace("`r`n", "`n") }
+    catch { return $false }
+    $current = (Get-RelayCredentialHelperSource).Replace("`r`n", "`n")
+    return $text -ceq $current
+}
+
+function Test-RelayTokensReferenceHelper {
+    param([object[]]$Tokens = @(), [string[]]$HelperPaths = @())
+    $targets = @($HelperPaths | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | ForEach-Object {
+        $slash = $_.Replace('\', '/')
+        @($_, $_.Replace("'", "''"), $slash, $slash.Replace("'", "''"))
+    } | Select-Object -Unique)
+    if (-not $targets.Count) { return $false }
+    foreach ($token in @($Tokens)) {
+        if ($token.Kind -ne 'string' -and $token.Kind -ne 'multi') { continue }
+        $value = [string]$token.Value
+        foreach ($target in $targets) {
+            if ($value.IndexOf($target, [StringComparison]::OrdinalIgnoreCase) -ge 0) { return $true }
+        }
+        if ($value.Length -ge 8 -and ($value.Length % 4) -eq 0 -and $value -match '\A[A-Za-z0-9+/=]+\z') {
+            try {
+                $decodedBytes = [Convert]::FromBase64String($value)
+                if (($decodedBytes.Length % 2) -eq 0 -and $decodedBytes.Length -gt 0) {
+                    $decodedText = [Text.Encoding]::Unicode.GetString($decodedBytes)
+                    foreach ($target in $targets) {
+                        if ($decodedText.IndexOf($target, [StringComparison]::OrdinalIgnoreCase) -ge 0) { return $true }
+                    }
+                }
+            } catch { }
+        }
+    }
+    return $false
+}
+
 function Move-RelayLegacyCredentials {
     param([string]$ConfigPath)
     Invoke-RelayStoreLock {
         $paths = Get-RelayPrivatePaths
         $legacy = Join-Path $script:RelayDataDirectory 'providers.json'
-        Assert-RelayCredentialParents $script:RelayDataDirectory
-        Assert-RelayCredentialAcl $script:RelayDataDirectory -Root
-        Assert-RelayCredentialAcl $legacy
-        $bytes = [IO.File]::ReadAllBytes($legacy)
-        $providers = @(Read-RelayJson $legacy -Default @())
-        foreach ($p in $providers) { $null = Read-RelayCredentialProvider $script:RelayDataDirectory $p.Id }
         $legacyHelper = Join-Path $script:RelayDataDirectory 'credentials\credential-helper.ps1'
-        if ([IO.File]::Exists($legacyHelper)) {
-            Assert-RelayCredentialAcl $legacyHelper
-            if (-not (Test-RelayLegacyHelperBytes ([IO.File]::ReadAllBytes($legacyHelper)))) { throw 'Legacy credential helper was modified; refusing migration.' }
+        $legacyPrivate = Get-RelayLegacyPrivatePaths
+        $hasLegacy = [IO.File]::Exists($legacy)
+        $separateLegacyPrivate = -not $legacyPrivate.Root.Equals($paths.Root, [StringComparison]::OrdinalIgnoreCase)
+        $hasLegacyPrivate = $separateLegacyPrivate -and [IO.File]::Exists($legacyPrivate.Providers)
+        if (-not $hasLegacy -and -not $hasLegacyPrivate) { return }
+
+        $bytes = $null
+        $providers = $null
+        if ($hasLegacy) {
+            Assert-RelayCredentialParents $script:RelayDataDirectory
+            Assert-RelayCredentialAcl $script:RelayDataDirectory -Root
+            Assert-RelayCredentialAcl $legacy
+            $bytes = [IO.File]::ReadAllBytes($legacy)
+            Assert-RelayCredentialProviderStoreBytes $bytes
+            $providers = @(Read-RelayJson $legacy -Default @())
+            foreach ($p in $providers) { $null = Read-RelayCredentialProvider $script:RelayDataDirectory $p.Id }
+            if ([IO.File]::Exists($legacyHelper)) {
+                Assert-RelayCredentialAcl ([IO.Path]::GetDirectoryName($legacyHelper))
+                Assert-RelayCredentialAcl $legacyHelper
+                if (-not (Test-RelayMigratableHelperBytes ([IO.File]::ReadAllBytes($legacyHelper)))) { throw 'Legacy credential helper was modified; refusing migration.' }
+            }
         }
+        if ($hasLegacyPrivate) {
+            Assert-RelayLegacyPrivateSource -LegacyBase $legacyPrivate.Base -LegacyRoot $legacyPrivate.Root
+            Assert-RelayCredentialAcl $legacyPrivate.Providers
+            $privateBytes = [IO.File]::ReadAllBytes($legacyPrivate.Providers)
+            Assert-RelayCredentialProviderStoreBytes $privateBytes
+            if ($hasLegacy) {
+                if ((Get-RelaySharedHash $privateBytes) -cne (Get-RelaySharedHash $bytes)) { throw 'Legacy and previous private credential stores differ; refusing migration.' }
+            } else {
+                $bytes = $privateBytes
+                $providers = @(Read-RelayJson $legacyPrivate.Providers -Default @())
+            }
+            if ([IO.File]::Exists($legacyPrivate.Helper)) {
+                Assert-RelayCredentialAcl ([IO.Path]::GetDirectoryName($legacyPrivate.Helper))
+                Assert-RelayCredentialAcl $legacyPrivate.Helper
+                if (-not (Test-RelayMigratableHelperBytes ([IO.File]::ReadAllBytes($legacyPrivate.Helper)))) { throw 'Legacy credential helper was modified; refusing migration.' }
+            }
+        }
+
         if ([IO.File]::Exists($paths.Providers)) {
             Assert-RelayCredentialAcl $paths.Providers
             if ((Get-RelaySharedHash ([IO.File]::ReadAllBytes($paths.Providers))) -cne (Get-RelaySharedHash $bytes)) { throw 'Private and legacy credential stores differ; refusing migration.' }
@@ -147,6 +320,12 @@ function Move-RelayLegacyCredentials {
                 [IO.File]::Move($temporary, $paths.Providers)
             } finally { if ([IO.File]::Exists($temporary)) { [IO.File]::Delete($temporary) } }
         }
+        foreach ($p in $providers) { $null = Read-RelayCredentialProvider $paths.Root $p.Id }
+
+        $retiredHelpers = New-Object 'Collections.Generic.List[string]'
+        [void]$retiredHelpers.Add($legacyHelper)
+        if ($separateLegacyPrivate) { [void]$retiredHelpers.Add($legacyPrivate.Helper) }
+
         $configPaths = New-Object 'Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
         [void]$configPaths.Add((Get-RelaySharedConfigPath $ConfigPath))
         foreach ($record in @(Get-RelaySharedConfigHistory)) { [void]$configPaths.Add($record.ConfigPath) }
@@ -172,8 +351,8 @@ function Move-RelayLegacyCredentials {
             }
             foreach ($entry in $doc.Entries) {
                 if ($covered.Contains($entry.Path)) { continue }
-                $references = @($doc.Tokens | Where-Object { $_.Start -ge $entry.ValueStart -and $_.End -le $entry.ValueEnd -and $_.Kind -eq 'string' -and $_.Value -ieq $legacyHelper })
-                if ($references.Count) { throw 'Unmanaged legacy credential reference found; refusing migration.' }
+                $entryTokens = @($doc.Tokens | Where-Object { $_.Start -ge $entry.ValueStart -and $_.End -le $entry.ValueEnd })
+                if (Test-RelayTokensReferenceHelper -Tokens $entryTokens -HelperPaths @($retiredHelpers)) { throw 'Unmanaged legacy credential reference found; refusing migration.' }
             }
         }
         $backup = Join-Path $paths.Root ('legacy-providers.' + [guid]::NewGuid().ToString('N') + '.bak')
@@ -185,9 +364,17 @@ function Move-RelayLegacyCredentials {
                 $plan = New-RelaySharedConfigPlan -Provider $job.Provider -Model 'credential-migration' -ConfigPath $job.Config -CatalogPath $job.Catalog -AuthConfig $job.Auth -AuthOnly
                 $transactions.Add((Invoke-RelaySharedConfigPlan $plan))
             }
-            Assert-RelayCredentialAcl $legacy
-            if ((Get-RelaySharedHash ([IO.File]::ReadAllBytes($legacy))) -cne (Get-RelaySharedHash $bytes)) { throw 'Legacy credential store changed during migration.' }
-            [IO.File]::Delete($legacy)
+            if ($hasLegacy) {
+                Assert-RelayCredentialAcl $legacy
+                if ((Get-RelaySharedHash ([IO.File]::ReadAllBytes($legacy))) -cne (Get-RelaySharedHash $bytes)) { throw 'Legacy credential store changed during migration.' }
+            }
+            if ($hasLegacyPrivate) {
+                Assert-RelayLegacyPrivateSource -LegacyBase $legacyPrivate.Base -LegacyRoot $legacyPrivate.Root
+                Assert-RelayCredentialAcl $legacyPrivate.Providers
+                if ((Get-RelaySharedHash ([IO.File]::ReadAllBytes($legacyPrivate.Providers))) -cne (Get-RelaySharedHash $bytes)) { throw 'Legacy credential store changed during migration.' }
+            }
+            if ($hasLegacy) { [IO.File]::Delete($legacy) }
+            if ($hasLegacyPrivate) { [IO.File]::Delete($legacyPrivate.Providers) }
         } catch {
             $failure = $_
             for ($i = $transactions.Count - 1; $i -ge 0; $i--) {
@@ -196,8 +383,9 @@ function Move-RelayLegacyCredentials {
             }
             throw $failure
         }
-        # Retire the old executable entry point only after all registered configs use the private helper.
+        # Retire the old executable entry points only after all registered configs use the private helper.
         if ([IO.File]::Exists($legacyHelper)) { [IO.File]::Delete($legacyHelper) }
+        if ($hasLegacyPrivate -and [IO.File]::Exists($legacyPrivate.Helper)) { [IO.File]::Delete($legacyPrivate.Helper) }
     }
 }
 
@@ -1091,11 +1279,15 @@ function Restore-RelaySharedConfig {
             if ((Get-RelaySharedHash $before) -cne $record.OriginalHash) { throw 'Shared config backup fingerprint is invalid.' }
         }
         $private = Get-RelayPrivatePaths
-        if (-not [IO.File]::Exists((Join-Path $script:RelayDataDirectory 'providers.json')) -and [IO.File]::Exists($private.Providers) -and $record.OriginalExists) {
+        $legacyPrivate = Get-RelayLegacyPrivatePaths
+        $separateLegacyPrivate = -not $legacyPrivate.Root.Equals($private.Root, [StringComparison]::OrdinalIgnoreCase)
+        if (-not [IO.File]::Exists((Join-Path $script:RelayDataDirectory 'providers.json')) -and (-not $separateLegacyPrivate -or -not [IO.File]::Exists($legacyPrivate.Providers)) -and [IO.File]::Exists($private.Providers) -and $record.OriginalExists) {
             Initialize-RelayTomlEditor
             $restored = [RelaySharedToml.Document]::Parse((ConvertFrom-RelaySharedBytes $before))
-            $retiredHelper = Join-Path $script:RelayDataDirectory 'credentials\credential-helper.ps1'
-            if (@($restored.Tokens | Where-Object { $_.Kind -eq 'string' -and $_.Value -ieq $retiredHelper }).Count) {
+            $retiredHelpers = New-Object 'Collections.Generic.List[string]'
+            [void]$retiredHelpers.Add((Join-Path $script:RelayDataDirectory 'credentials\credential-helper.ps1'))
+            if ($separateLegacyPrivate) { [void]$retiredHelpers.Add($legacyPrivate.Helper) }
+            if (Test-RelayTokensReferenceHelper -Tokens @($restored.Tokens) -HelperPaths @($retiredHelpers)) {
                 throw 'Backup references a retired credential helper; refusing to restore unsafe legacy authentication.'
             }
         }
@@ -2916,6 +3108,8 @@ function Start-RelayCodexUi {
 function Show-RelayStatus {
     Write-RelaySafe ('PowerShell：' + $PSVersionTable.PSVersion)
     Write-RelaySafe ('数据目录：' + $script:RelayDataDirectory)
+    try { Write-RelaySafe ('私有凭据目录：' + (Get-RelayPrivatePaths).Root) }
+    catch { Write-RelaySafe ('私有凭据根目录：' + $script:RelayCredentialBaseDirectory) }
     Write-RelaySafe ('当前 Provider：' + $script:RelaySelectedProvider + '；Model：' + $script:RelaySelectedModel)
     Write-RelaySafe '密钥：Windows DPAPI CurrentUser；仅注入 Codex 子进程，不修改父进程/用户/系统环境变量。'
     Write-RelaySafe '协议：仅 Responses；兼容性记录是历史最小文本探测，不保证工具及后续轮次。'

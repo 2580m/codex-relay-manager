@@ -121,3 +121,35 @@ Add-RelayTest 'SandboxCredentialAcl' 'Private storage inside or above the runtim
         }
     } finally { $script:RelayCredentialBaseDirectory = $saved }
 }
+
+Add-RelayTest 'SandboxCredentialAcl' 'Default credential base directory lives outside UserProfile under CommonApplicationData with safe ancestors' {
+    $defaultBase = Get-RelayDefaultCredentialBaseDirectory
+    $userProfile = [IO.Path]::GetFullPath([Environment]::GetFolderPath('UserProfile')).TrimEnd('\')
+    $commonData = [IO.Path]::GetFullPath([Environment]::GetFolderPath('CommonApplicationData')).TrimEnd('\')
+    $userSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+
+    Assert-Equal ([IO.Path]::GetDirectoryName($defaultBase)) $commonData
+    Assert-Equal ([IO.Path]::GetFileName($defaultBase)) ('codex-relay-private-' + $userSid)
+    Assert-True (-not $defaultBase.Equals($userProfile, [StringComparison]::OrdinalIgnoreCase))
+    Assert-True (-not $defaultBase.StartsWith($userProfile + '\', [StringComparison]::OrdinalIgnoreCase))
+    Assert-RelayCredentialPath $defaultBase
+    Assert-RelayCredentialParents $defaultBase
+
+    $scriptPath = Join-Path (Split-Path $PSScriptRoot -Parent) 'codex-relay.ps1'
+    $cmd = "& { . '" + $scriptPath.Replace("'", "''") + "' -LibraryOnly; Write-Output `$script:RelayCredentialBaseDirectory }"
+    $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($cmd))
+    $psExe = [IO.Path]::Combine([Environment]::GetFolderPath([Environment+SpecialFolder]::System), 'WindowsPowerShell', 'v1.0', 'powershell.exe')
+    $bound = (& $psExe -NoProfile -NonInteractive -EncodedCommand $encoded) -join ''
+    Assert-Equal $LASTEXITCODE 0
+    Assert-Equal $bound.Trim() $defaultBase
+}
+
+Add-RelayTest 'SandboxCredentialAcl' 'Empty or whitespace CredentialBaseDirectory fails cleanly with Invalid credential data path' {
+    $saved = $script:RelayCredentialBaseDirectory
+    try {
+        foreach ($bad in @('', '   ')) {
+            $script:RelayCredentialBaseDirectory = $bad
+            [void](Assert-Throws { Get-RelayPrivatePaths } 'Invalid credential data path')
+        }
+    } finally { $script:RelayCredentialBaseDirectory = $saved }
+}

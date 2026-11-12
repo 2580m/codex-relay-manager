@@ -126,9 +126,11 @@ function Invoke-RelayTestCase {
     param($Test)
     $script:RTCaseDirectory = New-RelayTestDirectory
     $oldCredentialBase = $script:RelayCredentialBaseDirectory
-    # Temp/AppData may be writable by sandbox identities; exercise a safe private ancestry.
-    $privateTestBase = Join-Path ([Environment]::GetFolderPath('UserProfile')) ('.relay-private-tests-' + [guid]::NewGuid().ToString('N'))
+    $oldLegacyCredentialBase = $script:RelayLegacyCredentialBaseDirectory
+    # Temp/AppData/UserProfile may receive sandbox Modify ACEs; exercise a safe CommonApplicationData private ancestry.
+    $privateTestBase = Join-Path ([Environment]::GetFolderPath('CommonApplicationData')) ('codex-relay-tests-' + [guid]::NewGuid().ToString('N'))
     $script:RelayCredentialBaseDirectory = $privateTestBase
+    $script:RelayLegacyCredentialBaseDirectory = Join-Path $privateTestBase 'unused-legacy-private'
     $oldPreference = $ErrorActionPreference
     try {
         $ErrorActionPreference = 'Stop'
@@ -141,10 +143,11 @@ function Invoke-RelayTestCase {
         $ErrorActionPreference = $oldPreference
         if (Test-Path -LiteralPath $script:RTCaseDirectory) { Remove-Item -LiteralPath $script:RTCaseDirectory -Force -Recurse }
         $resolvedPrivate = [IO.Path]::GetFullPath($privateTestBase)
-        $testPrivateParent = [IO.Path]::GetFullPath([Environment]::GetFolderPath('UserProfile')).TrimEnd('\')
-        if ([IO.Path]::GetDirectoryName($resolvedPrivate) -ine $testPrivateParent -or [IO.Path]::GetFileName($resolvedPrivate) -cnotmatch '^\.relay-private-tests-[a-f0-9]{32}$') { throw 'Test private cleanup escaped its dedicated test directory.' }
+        $testPrivateParent = [IO.Path]::GetFullPath([Environment]::GetFolderPath('CommonApplicationData')).TrimEnd('\')
+        if ([IO.Path]::GetDirectoryName($resolvedPrivate) -ine $testPrivateParent -or [IO.Path]::GetFileName($resolvedPrivate) -cnotmatch '^codex-relay-tests-[a-f0-9]{32}$') { throw 'Test private cleanup escaped its dedicated test directory.' }
         if (Test-Path -LiteralPath $resolvedPrivate) { Remove-Item -LiteralPath $resolvedPrivate -Force -Recurse }
         $script:RelayCredentialBaseDirectory = $oldCredentialBase
+        $script:RelayLegacyCredentialBaseDirectory = $oldLegacyCredentialBase
     }
 }
 function Get-TestTomlLiteralValue {

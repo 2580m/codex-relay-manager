@@ -210,7 +210,7 @@ requires_openai_auth = false
 ├── shared-config\                 # 受限 ACL 的共享配置备份及事务记录
 └── logs\
 
-%USERPROFILE%\.codex-relay-private\
+%ProgramData%\codex-relay-private-<当前用户SID>\
 └── <数据目录路径的 SHA-256>\       # 不同 -DataDirectory 对应不同私有存储
     ├── providers.json             # 仅 DPAPI 密文与 Provider 元数据
     ├── credentials\
@@ -218,15 +218,15 @@ requires_openai_auth = false
     └── legacy-providers.*.bak      # 迁移前的原始密文备份（如有）
 ```
 
-可以用 `-DataDirectory 'D:\private\codex-relay-data'` 指定**专用目录**，不要指向项目根目录或与其他应用共享的目录。助手及密文独立于模型目录和 `auth.cwd`，默认放在用户主目录的 `.codex-relay-private` 下；也可用 `-CredentialBaseDirectory` 指定独立私有根目录，两棵目录不得互相包含。初始化私有存储时仅授予当前 Windows 用户与 SYSTEM 完全控制，不自动修复已存在但被改宽的私有目录。助手运行时只检查权限，不修复权限。
+可以用 `-DataDirectory 'D:\private\codex-relay-data'` 指定**专用目录**，不要指向项目根目录或与其他应用共享的目录。助手及密文独立于模型目录和 `auth.cwd`，默认放在 `%USERPROFILE%` 之外的 `%ProgramData%\codex-relay-private-<当前用户SID>` 下（避免 Windows Codex 沙箱向用户主目录直系子目录写入 `Modify` 权限导致父目录校验失败）；也可用 `-CredentialBaseDirectory` 指定独立私有根目录，两棵目录不得互相包含。初始化私有存储时仅授予当前 Windows 用户与 SYSTEM 完全控制，不自动修复已存在但被改宽的私有目录。助手运行时只检查权限，不修复权限。
 
-私有目录的父路径也必须可信：若额外身份对任一父目录具有删除、删除子项、修改 ACL 或取得所有权权限，将拒绝部署或解密，防止通过重命名父目录、替换整个目录绕过子目录保护。对仅用于后代的继承规则按其实际作用路径检查；符号链接及重解析点仍拒绝。不要默认认为 `AppData`/`Temp` 安全，本机沙箱可能曾向这些路径赋权。
+私有目录的父路径也必须可信：若额外身份对任一父目录具有删除、删除子项、修改 ACL 或取得所有权权限，将拒绝部署或解密，防止通过重命名父目录、替换整个目录绕过子目录保护。对仅用于后代的继承规则按其实际作用路径检查；符号链接及重解析点仍拒绝。不要默认认为 `%USERPROFILE%`、`AppData`、`Temp` 或自带 `Authenticated Users: Modify` 的磁盘根目录安全，Windows Codex 沙箱或系统默认 ACL 可能向这些路径赋权。
 
 持久认证使用系统 Windows PowerShell 的 `-EncodedCommand` 启动固定的安全引导代码（仅代码、路径及 Provider ID，不包含密钥），先建立无 BOM 的 UTF-8 标准错误通道，再检查私有目录权限并调用助手。这样脚本缺失、解析或执行策略错误不会直接泄露 PowerShell 本地编码的启动诊断，而是返回固定英文、含 stage/exception/HRESULT 的安全错误。标准输出仍仅含原始 UTF-8 密钥字节；不更改系统编码、代码页或执行策略。启动器编码参数不是加密机制。
 
-运行中的 App 可能缓存旧的 `auth.args`。更改认证路径或启动方式后，必须完全退出并重新打开 App；仅新建会话可能仍调用已退役的 `-File` 路径。不存在的旧脚本由 PowerShell 在执行任何助手代码前报错，管理器无法给这种已缓存的原生错误补设输出编码。
+运行中的 App 可能缓存旧的 `auth.args`。更改认证路径或启动方式后，必须完全退出并重新打开 App；仅新建会话可能仍调用已退役的旧认证路径。不存在的旧脚本由 PowerShell 在执行任何助手代码前报错，管理器无法给这种已缓存的原生错误补设输出编码。
 
-旧版用户使用以下命令执行一次迁移（可同时指定原来的 `-DataDirectory`）：
+旧版用户（包含早先位于 `%USERPROFILE%\.codex-relay\` 或 `%USERPROFILE%\.codex-relay-private\` 的私有目录）使用以下命令执行一次迁移（可同时指定原来的 `-DataDirectory`）：
 
 ```powershell
 .\codex-relay.ps1 -MigrateLegacyCredentials

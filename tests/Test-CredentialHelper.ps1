@@ -8,7 +8,7 @@ function Invoke-CredentialTestProcess {
     $info.FileName = $Command
     $info.Arguments = (($Arguments | ForEach-Object { ConvertTo-WindowsArgument $_ }) -join ' ')
     $info.UseShellExecute = $false; $info.CreateNoWindow = $true
-    $info.RedirectStandardOutput = $true; $info.RedirectStandardError = $true
+    $info.RedirectStandardInput = $true; $info.RedirectStandardOutput = $true; $info.RedirectStandardError = $true
     $info.StandardOutputEncoding = New-Object Text.UTF8Encoding($false, $true)
     $info.StandardErrorEncoding = [Text.Encoding]::UTF8
     $info.WorkingDirectory = $Cwd
@@ -21,6 +21,7 @@ function Invoke-CredentialTestProcess {
     $stdoutBytes = New-Object IO.MemoryStream
     try {
         [void]$process.Start()
+        $process.StandardInput.Close()
         # Read raw bytes: StreamReader would silently strip a BOM and hide a regression.
         $stdout = $process.StandardOutput.BaseStream.CopyToAsync($stdoutBytes)
         $stderr = $process.StandardError.ReadToEndAsync()
